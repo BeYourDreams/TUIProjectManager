@@ -536,46 +536,7 @@ fn ui_gray(ui: &egui::Ui) -> Color32 {
     }
 }
 
-/// 渲染时强制过一遍颜色：按实际背景亮度差验证前景色，
-/// 对比不足（含真假同色）时翻成黑/白兑底，保证文字与背景永不相同。
-/// 量一段文字的宽度（与 egui 排版一致：正文号、不换行）。状态栏做宽度预算
-/// 时用它把右侧固定簇/左侧按钮的真实占宽算出来。
-pub fn text_width(ui: &egui::Ui, text: &str) -> f32 {
-    let font = ui.style().text_styles[&egui::TextStyle::Body].clone();
-    ui.painter()
-        .layout(text.to_owned(), font, egui::Color32::PLACEHOLDER, f32::INFINITY)
-        .size()
-        .x
-}
-
-/// 量一个**文本按钮**的宽度：正文号 + 框内边距。依据 egui 的
-/// `Style::button_style`：按钮的 fallback 字号就是 TextStyle::Body，
-/// inner_margin = button_padding + expansion - bg_stroke.width（左右各一份）。
-pub fn button_text_width(ui: &egui::Ui, label: &str) -> f32 {
-    let v = &ui.visuals().widgets.inactive;
-    let pad = (ui.spacing().button_padding.x + v.expansion - v.bg_stroke.width).max(0.0);
-    text_width(ui, label) + 2.0 * pad + v.bg_stroke.width
-}
-
-/// 状态栏消息该占多宽（纯函数，便于单测）。
-///
-/// `avail` 是整行行宽、`left_w` 是扣掉右侧固定簇后左段真正能用的宽度、
-/// `buttons_w` 是待办按钮（自更新 / 工具入口 / 重启）的实测总宽。规则：
-/// 封顶行宽的 45%（下限 120px，窗口极窄就全给消息），再扣掉按钮实际占的宽度；
-/// 剩下的不足 MIN_MSG_W 就**整条消息不画**（返回 0）—— 此时按钮已经放不下，
-/// 由外层横向滚动区出滚动条兜底，消息不能没有而按钮被藏起来。
-pub fn status_msg_width(avail: f32, left_w: f32, buttons_w: f32, gap: f32) -> f32 {
-    const MIN_MSG_W: f32 = 40.0; // 再窄这条消息就没信息量了
-    let cap = if avail < 80.0 { avail } else { (avail * 0.45).max(120.0) };
-    let free = left_w - buttons_w - gap;
-    if free < MIN_MSG_W {
-        0.0
-    } else {
-        cap.min(free)
-    }
-}
-
-/// 渲染时强制过一遍颜色：按实际背景亮度差验证前景色，
+/// 渲染时强制过一遍颜色
 /// 对比不足（含真假同色）时翻成黑/白兑底，保证文字与背景永不相同。
 fn forced_contrast_color(fg: Color32, bg: Color32) -> Color32 {
     let lum = |c: Color32| 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
@@ -3947,8 +3908,8 @@ impl ClientApp {
         let saved_active = config.tabs.active;
         let mut app = Self {
             config,
-            // 设置页签常驻：与首页一样是**页面**而不是会话，固定在下标 1（首页之后），
-            // 不用任何按钮去开（右下角「⋯ 更多」里的「⚙ 设置」已移除）。
+// 设置页签常驻：与首页一样是**页面**而不是会话，固定在下标 1（首页之后），
+            // 不靠任何按钮打开（页签栏上直接点）。
             tabs: vec![Tab::Home, Tab::Settings],
             current: 0,
             screen: Screen::Main,
@@ -5743,20 +5704,12 @@ let s = TAB_GAP;
         self.status = Some("正在切换命令...".to_string());
     }
 
-/// 状态栏横向布局的一行：左侧消息（可截断），右侧固定簇（现在只剩「⋯ 更多」
-/// 一个按钮）永远可见。检查更新 / 打开目录 / 深浅色都收进它的弹出层（设置
-/// 已改从页签栏的常驻「⚙ 设置」页签进，不再是按钮）。
+/// 状态栏：就一条消息（放不下就截断 + 悬停看全文，右键复制）。
 ///
-/// 右侧固定簇是 `Layout::right_to_left` **贴右边**画的，它不看左边已经占了
-/// 多宽 —— 左边放不下时不是换行而是直接盖上去。故先量出右侧簇的宽度，左段
-/// （就一条消息）只拿剩下的，且左段画在**横向滚动区**里：还挤不下就横向拨
-/// （滚轮即可，滚动条不画），绝不互相盖住。
-///
-/// 待办按钮都不在这条行里了：pi / opencode 的安装/升级入口与本程序自己的
-/// 自更新（下载 / 取消 / 重启）都已搬到「设置 → 工具更新路径」末尾的
-/// 「⬇ 下载 / 更新」区（`tool_entry_button_ui` / `self_update_buttons_ui`）——
-/// 低频操作挤在最窄的一行里点不准，字小还得悬停才知道干什么；搬走后左段只剩
-/// 消息，横向滚动那条兜底几乎用不上、仍留着以防万一。
+/// 这一行原来右侧还有个「⋯ 更多」固定簇（检查更新 / 打开目录 / 深浅色）。
+/// 那三项连同「检查更新」按钮全部搬进设置页（`settings_ui` 顶部那一行），
+/// 固定簇连同按钮一起删了：这里没别的控件需要避让，横向滚动区与宽度预算
+/// 一并去掉，消息直接吃满整行。下载/取消/重启与工具安装入口仍在设置页。
     /// 状态栏这条消息是不是「发现新版本」提示（可点 → 跳设置页顶部下载）。
     ///
     /// **只看文案，不看 `update_latest` 是否还在**：检查更新回来的那条事件会把
@@ -5782,7 +5735,7 @@ let s = TAB_GAP;
                         ui_gray(ui),
                     ),
                     _ => (
-                        "选择项目 → 启动（内嵌终端页签）   |   添加 / 重命名 / 改路径 / 删除   |   右下角 ⋯ 更多信息"
+"选择项目 → 启动（内嵌终端页签）   |   添加 / 重命名 / 改路径 / 删除   |   检查更新 / 深浅色 / 打开目录：页签栏「⚙ 设置」"
                             .to_string(),
                         ui_gray(ui),
                     ),
@@ -5798,53 +5751,18 @@ let s = TAB_GAP;
             ui.visuals_mut().override_text_color = None;
             let copy_snapshot = text.clone(); // 渲染前快照，供悬停/右键复制（label 会 move text）
 
-            // ================= 宽度预算 =================
-            // 右侧固定簇（⋯ 更多）是 right_to_left 贴右边画的，不看左边占了多宽，
-            // 放不下就是直接盖上去。故先量它，剩下的才是消息的（封顶行宽的 45%、
-            // 下限 120px，超出以省略号截断，悬停看全文）；连最小宽度都腾不出时整条
-            // 消息不画 —— 消息可以没有。
-            let item_x = ui.spacing().item_spacing.x;
-            // 主题：当前状态（弹层里那一项的文案，切完下一帧就变）+ 轮转用。
-            let (fs, dark) = (self.config.settings.follow_system, self.effective_dark());
-            let theme_label = if fs { "🎨 跟随系统" } else if dark { "🌙 深色" } else { "☀ 浅色" };
-            // 右侧固定簇只剩「⋯ 更多」一个按钮（其余全在弹层里）。
-            let right_w = button_text_width(ui, "⋯ 更多") + 8.0; // + 测量误差余量
-            // 左段能占多宽：行宽先扣掉右侧固定簇（它贴右边画，不让位）。
-            let avail = ui.available_width();
-            let left_w = (avail - right_w - item_x).max(60.0);
-            let msg_w = status_msg_width(avail, left_w, 0.0, item_x);
+// 消息吃满整行：这一行右边没别的控件了（右侧簇已删），不用做宽度
+            // 预算，也不必横向滚动——Label 截断 + 悬停看全文已经够。
+            let msg_w = ui.available_width();
             let row_h = ui
                 .spacing()
                 .interact_size
                 .y
                 .max(ui.text_style_height(&egui::TextStyle::Body));
-            // 高度就一行：横向滚动条已隐藏（AlwaysHidden），不再为它预留一条
-            // （原来不留就等于内容被自己的滚动条切掉一截）；留 2px 缝给按钮描边。
-            // 横向单向滚动区默认只吃水平滚轮（鼠标滚轮是 delta.y，拨不动），开这
-            // 个开关让它把垂直滚轮也当横向拨（只在本段生效，不影响设置页）——滚动
-            // 条隐藏后这就是唯一的滚动入口，必须留着。
-            let saved_scroll_dir = ui.style().always_scroll_the_only_direction;
-            ui.style_mut().always_scroll_the_only_direction = true;
-            egui::ScrollArea::horizontal()
-                .id_salt("status_left_scroll")
-                // 只留滚动、不画条：AlwaysHidden 时 egui 既不画横条也不从可用高度
-                // 里扣它（ScrollArea::begin 的 show_bars 恒 false → current_bar_use
-                // 为 0），滚轮 / Shift+滚轮照常生效（ScrollSource::mouse_wheel 默认开）。
-                // 状态栏就这一行高度，露一条 8px 的滚动条既占地方又抢眼。
-                .scroll_bar_visibility(egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                // 宽度就是左段能用的宽度：右侧簇还没排（它贴右边缘），不写死
-                // max_width 的话这里会抢走整行，右侧簇又叠回它身上。
-                .max_width(left_w)
-                .max_height(row_h + 2.0)
-                // x 不自动收缩：宽度就这么多，挤不下就横向滚（滚动条已隐藏）；y 收缩到内容。
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                    // ---- 消息 ----
-                    if msg_w > 8.0 {
-                        // “发现新版本 …” 这类提示点一下直达设置页顶部的更新横幅
-                        // （下载按钮在那儿）。其余消息只提供悬停全文 + 右键复制。
-                        let is_update_hint = Self::status_msg_is_update_hint(&text);
+            {
+                // “发现新版本 …” 这类提示点一下直达设置页顶部的更新横幅
+                // （下载按钮在那儿）。其余消息只提供悬停全文 + 右键复制。
+                let is_update_hint = Self::status_msg_is_update_hint(&text);
                         // 不能用 ui.add_sized()：它内部固定用
                         // Layout::centered_and_justified（egui 0.36 ui.rs:1543），
                         // 于是 label 整个被**居中**摆在 msg_w × row_h 的框里——
@@ -5899,104 +5817,8 @@ let s = TAB_GAP;
                         if is_update_hint && label_resp.clicked() {
                             self.open_settings();
                         }
-                    } else {
-                        // 连最小宽度都腾不出（窗口极窄到右侧簇就占满了整行）：这条消息
-                        // 不画。左段已无待办按钮，挤不出宽度时也就没什么可让的了。
-                        ui.visuals_mut().override_text_color = saved_override;
-                    }
-                    });
-                });
-            ui.style_mut().always_scroll_the_only_direction = saved_scroll_dir;
-            // 右下角固定簇只剩一个「⋯ 更多」按钮：检查更新 / 打开目录 / 深浅色
-            // 全部收进它的弹出层（原先挤在这一行的几个按钮点不准，也把行宽吃掉
-            // 了大半）。它是 right_to_left 里**最先添加**的那个 = 最右侧。
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // 「⋯ 更多」按钮只响应鼠标点击，防止键盘方向键选中后回车误触发。
-                let more_id = egui::Id::new("status_more_menu");
-                // Sense::CLICK 不含 FOCUSABLE 位：不参与键盘焦点循环（Tab/方向键不会选中它）。
-                let more_resp = ui
-                    .add(egui::Button::new("⋯ 更多").sense(egui::Sense::CLICK))
-                    .on_hover_text("检查更新 / 打开目录 / 深浅色切换（设置请点页签栏的「⚙ 设置」）");
-                if more_resp.clicked() && ui.input(|i| i.pointer.any_click()) {
-                    egui::Popup::toggle_id(ui.ctx(), more_id);
-                }
-                // CloseOnClickOutside：egui 的 Popup 默认是 CloseOnClick，**点弹层
-                // 里的任何一项都会顺手把菜单关掉**（ComboBox/菜单才是那个语义）。
-                // 这里要的是「点了项菜单还在」，故改成只有点在弹层**外面**才关——
-                // 菜单项里也就不调 ui.close()（那会立刻置 CLOSE 标记，绕过
-                // close_behavior 直接关掉）。连着点两三个项（查完更新接着切主题）
-                // 不用反复把菜单点开。再点「⋯ 更多」本身仍是切换开关。
-                egui::Popup::from_response(&more_resp)
-                    .id(more_id)
-                    .open_memory(None)
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                    .show(|ui| {
-                        // 弹出层跟随菜单项文字自适应大小：不 set_width（窄了会截断
-                        // 「📂 打开用户目录」，宽了右边留白）。
-                        // 菜单项左对齐：Align::Min —— 状态栏本身是 right_to_left，
-                        // 弹层内沿用 Align::RIGHT 会把文字甩到右边，左边空一大块。
-                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                            // 「⚙ 设置」已删：设置页签常驻在页签栏首页右边（与首页
-                            // 同款同尺寸），点一下就进去，不需要再来一个按钮。
-                            if ui.selectable_label(false, "🔄 检查更新")
-                                .on_hover_text("从 GitHub Release 检查本软件 + pi + opencode 的最新版本（启动/新开页签时也会自动检查）")
-                                .clicked()
-                            {
-                                self.check_updates(false);
-                            }
-                            ui.separator();
-                            if ui.selectable_label(false, "📂 打开用户目录")
-                                .on_hover_text("打开用户目录（%USERPROFILE%），便于修改 agent 配置")
-                                .clicked()
-                            {
-                                let dir = std::env::var("USERPROFILE")
-                                    .or_else(|_| std::env::var("HOME"))
-                                    .unwrap_or_else(|_| ".".to_string());
-                                self.open_explorer(dir);
-                            }
-                            if ui.selectable_label(false, "📂 打开软件目录")
-                                .on_hover_text("打开本软件 exe 所在的目录（与本软件配置目录同级）")
-                                .clicked()
-                            {
-                                let dir = software_dir().unwrap_or_else(|| PathBuf::from("."));
-                                self.open_explorer(dir);
-                            }
-                            ui.separator();
-                            // 深浅色：菜单项本身就是当前状态（theme_label），点一下
-                            // 轮转 深色 → 浅色 → 跟随系统 → 深色。菜单不关（close_behavior），
-                            // 想连着调就接着点。
-                            if ui.selectable_label(false, theme_label)
-                                .on_hover_text("点击切换：深色 → 浅色 → 跟随系统（随 Windows 深浅自动切换）")
-                                .clicked()
-                            {
-                                if fs {
-                                    // 跟随系统 → 切回固定深色。
-                                    self.config.settings.follow_system = false;
-                                    self.config.settings.dark_mode = true;
-                                } else if dark {
-                                    // 深色 → 浅色。
-                                    self.config.settings.dark_mode = false;
-                                } else {
-                                    // 浅色 → 跟随系统。
-                                    self.config.settings.follow_system = true;
-                                }
-                                apply_theme(ui.ctx(), self.effective_dark());
-                                self.save_config("已切换主题".to_string());
-                                // 通知所有会话新主题：应答 OSC 10/11 查询 + 主动广播颜色
-                                // （opencode 等 TUI 会据此匹配自己的配色）。
-                                self.broadcast_theme();
-                                // 延迟全量重绘：子进程收到广播后重绘需要时间，晚到的输出
-                                // 可能在清缓存之后才写入；定时再清一次并强制整帧，兜住
-                                // 这类脏状态。
-                                self.theme_settle_at = Some(
-                                    std::time::Instant::now() + std::time::Duration::from_millis(100),
-                                );
-                                ui.ctx().request_repaint();
-                            }
-                        });
-                    });
-            });
-        });
+}
+});
     }
 
     fn home_ui(&mut self, ui: &mut egui::Ui) {
@@ -6425,10 +6247,13 @@ let s = TAB_GAP;
         // 有可更新/可安装的东西时，页顶会摆一个更新区（带下载/取消/重启按钮）。
         // 不占平时的版面：没得下就整块不画，用户不用在一堆设置里找“没得下”。
         self.update_zone_ui(ui);
-        // 三大块内容都很长（命令列表 / 路径列表 / 供应商+模型表），平时用不上，
+// 三大块内容都很长（命令列表 / 路径列表 / 供应商+模型表），平时用不上，
         // 全摊开会把「设置」顶成好几屏。故都做成折叠面板（手风琴，严格互斥：同
         // 一时刻只展开一块，点另一块就自动收起）：收起时只剩标题行 + 一句摘要
         // （条数 / 当前项），展开才画正文。
+        // 常用四项（检查更新 / 深浅色 / 打开两个目录）从状态栏右下角「⋯ 更多」
+        // 搬来，摆在三大块上面 —— 那个按钮连同弹层已删。
+        self.settings_quick_actions_ui(ui);
         self.load_settings_sec_once(ui);
         self.commands_section_ui(ui);
         self.tool_dirs_section_ui(ui);
@@ -6589,6 +6414,73 @@ ui.add_space(12.0);
         ui.id()
             .with(egui::IdSalt::new("child"))
             .with(egui::IdSalt::new(id_salt))
+    }
+
+/// 设置页顶部的一行常用入口：检查更新 / 深浅色 / 打开用户目录 / 打开软件
+    /// 目录。原先是状态栏右下角「⋯ 更多」弹层里的四项，那个按钮连同弹层已删。
+    fn settings_quick_actions_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .button("🔄 检查更新")
+                .on_hover_text("从 GitHub Release 检查本软件 + pi + opencode 的最新版本（启动/新开页签时也会自动检查）")
+                .clicked()
+            {
+                self.check_updates(false);
+            }
+            self.theme_button_ui(ui);
+            if ui
+                .button("📂 打开用户目录")
+                .on_hover_text("打开用户目录（%USERPROFILE%），便于修改 agent 配置")
+                .clicked()
+            {
+                let dir = std::env::var("USERPROFILE")
+                    .or_else(|_| std::env::var("HOME"))
+                    .unwrap_or_else(|_| ".".to_string());
+                self.open_explorer(dir);
+            }
+            if ui
+                .button("📂 打开软件目录")
+                .on_hover_text("打开本软件 exe 所在的目录（与本软件配置目录同级）")
+                .clicked()
+            {
+                let dir = software_dir().unwrap_or_else(|| PathBuf::from("."));
+                self.open_explorer(dir);
+            }
+        });
+        ui.add_space(6.0);
+    }
+
+    /// 深浅色轮转按钮：文案就是当前状态，点一下 深色 → 浅色 → 跟随系统 → 深色。
+    fn theme_button_ui(&mut self, ui: &mut egui::Ui) {
+        let (fs, dark) = (self.config.settings.follow_system, self.effective_dark());
+        let label = if fs { "🎨 跟随系统" } else if dark { "🌙 深色" } else { "☀ 浅色" };
+        if ui
+            .button(label)
+            .on_hover_text("点击切换：深色 → 浅色 → 跟随系统（随 Windows 深浅自动切换）")
+            .clicked()
+        {
+            if fs {
+                // 跟随系统 → 切回固定深色。
+                self.config.settings.follow_system = false;
+                self.config.settings.dark_mode = true;
+            } else if dark {
+                // 深色 → 浅色。
+                self.config.settings.dark_mode = false;
+            } else {
+                // 浅色 → 跟随系统。
+                self.config.settings.follow_system = true;
+            }
+            apply_theme(ui.ctx(), self.effective_dark());
+            self.save_config("已切换主题".to_string());
+            // 通知所有会话新主题：应答 OSC 10/11 查询 + 主动广播颜色
+            // （opencode 等 TUI 会据此匹配自己的配色）。
+            self.broadcast_theme();
+            // 延迟全量重绘：子进程收到广播后重绘需要时间，晚到的输出可能在清
+            // 缓存之后才写入；定时再清一次并强制整帧，兜住这类脏状态。
+            self.theme_settle_at =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(100));
+            ui.ctx().request_repaint();
+        }
     }
 
     /// 设置页折叠面板 1/3：TUI 启动命令。标题行带摘要（命令数 + 当前选中项），
@@ -10219,57 +10111,7 @@ mod update_tests {
         assert_eq!(local_version_with_floor("", None), "");
     }
 
-    /// TEMP-DIAG-REMOVED
-    /// button_text_width 的估算要和 egui Button 的真实宽度对得上（否则宽度
-    /// 预算算错，按钮照样会被右侧簇盖住）。单测里用 egui 的测试 Ui 真加一个
-    /// 按钮，拿 Response 的宽做对照，容忍 1px 排版误差。
-    #[test]
-    fn button_text_width_matches_egui() {
-        use super::button_text_width;
-        eframe::egui::__run_test_ui(|ui| {
-            for l in [
-                "⋯ 更多",
-                "🔄 检查更新",
-                "🌙 深色",
-                "⬇ 下载 2026.09.13",
-                "⬇ 装 pi 到本软件目录",
-                "🔄 重启应用",
-                "✕ 取消",
-            ] {
-                let actual = ui.add(eframe::egui::Button::new(l)).rect.width();
-                let pred = button_text_width(ui, l);
-                assert!(
-                    (actual - pred).abs() <= 1.0,
-                    "「{l}」宽度估偏：预估 {pred:.1} vs 实际 {actual:.1}"
-                );
-            }
-        });
-    }
 
-    /// 状态栏消息宽度：先扣右侧固定簇（它贴右边画，不看左边、不换行、只盖上
-    /// 去），再扣待办按钮；不够就不画这条消息，溢出交给横向滚动区。
-    #[test]
-    fn status_msg_width_reserves_buttons() {
-        use super::status_msg_width;
-        // 现场：行宽 1400，右侧簇约 270 → 左段 1120；一条工具入口 + 自更新约
-        // 315。宽裕时消息拿满 45% 上限。
-        let msg = status_msg_width(1400.0, 1120.0, 315.0, 8.0);
-        assert!((msg - 630.0).abs() < 0.5, "宽裕时取上限，实际 {msg}");
-
-        // 行宽 900（左段 620）：工具按钮占 315，剩 ~297 给消息 → 缩到剩余宽度，
-        // 不用滚动条就能一行摆下。
-        let msg = status_msg_width(900.0, 620.0, 315.0, 8.0);
-        assert!(msg > 40.0 && msg < 405.0, "应缩到剩余宽度，实际 {msg}");
-
-        // 行宽 560（左段 280）：按钮自己就装不下了 → 消息整条不画（0），剩下
-        // 交给滚动条，否则画出来就是一条几个字的碎片。
-        assert_eq!(status_msg_width(560.0, 280.0, 315.0, 8.0), 0.0);
-
-        // 没有按钮时消息拿满上限；窗口极窄（<80px）时全给消息但也不超上限。
-        let msg = status_msg_width(1400.0, 1120.0, 0.0, 8.0);
-        assert!((msg - 630.0).abs() < 0.5, "无按钮时取上限，实际 {msg}");
-        assert!(status_msg_width(60.0, 60.0, 0.0, 8.0) <= 60.0);
-    }
 
     /// 状态栏工具入口的判定：升级优先；已是最新但本软件目录里没有那份时，
     /// 仍给「装到本软件目录」（否则 PATH 里那份会让这台机器一个入口都没有，

@@ -1669,7 +1669,7 @@ egui::Event::Copy => {
     // ── 阻止 egui 用方向键在控件间导航焦点 ──
     // egui Focus::begin_pass 在每帧开头读取 focused_widget 的 EventFilter：
     // 若 horizontal_arrows / vertical_arrows 为 false（默认），方向键会设置
-    // focus_direction → end_pass 把焦点移到相邻控件（"更多"按钮等）。
+// focus_direction → end_pass 把焦点移到相邻控件。
     // 两步修复：
     // 1. set_focus_lock_filter 声明方向键归终端（从第二帧起生效，需 had_focus_last_frame）。
     // 2. move_focus(None) 清除本帧已被 begin_pass 设下的方向（兜底第一帧）。
