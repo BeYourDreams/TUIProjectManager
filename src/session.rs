@@ -41,9 +41,7 @@ use alacritty_terminal::vte::ansi::{CursorShape, Processor};
 use eframe::egui;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
-use crate::term_gl::{hash_mix, raw_color_key};
-
-// ── 无锁快照：reader 线程生成，UI 线程通过 AtomicPtr 加载，零锁竞争 ──
+// ── 无锁快照
 
 /// 终端渲染快照：包含 UI 渲染一帧所需的全部数据。
 #[allow(dead_code)]
@@ -51,11 +49,7 @@ use crate::term_gl::{hash_mix, raw_color_key};
 pub struct TermSnapshot {
 /// 可见格子 (point, cell)。
     pub cells: Vec<(Point, CellSnap)>,
-    /// 每可视行（vline = line + offset）的行指纹，下标即 vline。
-    /// 在构建快照时顺手算（cells 本来就要逐格 clone）：渲染端据此判定行级
-    /// 增量，不用再重扫 rows×cols 个格子。内容相同的行指纹必相同，反之不必。
-    pub row_hashes: Vec<u64>,
-    /// 显示偏移。
+/// 显示偏移。
     pub offset: usize,
     /// 光标位置。
     pub cursor_point: Point,
@@ -101,42 +95,21 @@ pub fn build_snapshot(t: &Term<SessionListener>, snap_gen: u64) -> TermSnapshot 
 // 预分配：display_iter 恰好吐 screen_lines×columns 个格。原先两个 Vec 从
     // 零长起，每次重建要 log2(2400)≈11 次 doubling（重分配 + 全量拷贝）——
     // 滚动时每帧一次，是白付的。
-    let cap = t.grid().screen_lines() * t.grid().columns();
+let cap = t.grid().screen_lines() * t.grid().columns();
     let mut cells = Vec::with_capacity(cap);
-    // 行指纹：cells 按 vline 升序（display_iter 自下而上，vline = line+offset），
-    // 遇行号变化就封口上一行。种子带 vline，滚动换位也算内容变化。
-    let mut row_hashes: Vec<u64> = Vec::with_capacity(t.grid().screen_lines());
-    let mut cur_line = i32::MIN;
-    let mut rh = 0u64;
     for indexed in content.display_iter {
         let p = indexed.point;
-        let v = p.line.0 + offset as i32;
-        if v < 0 {
+        if (p.line.0 + offset as i32) < 0 {
             continue;
         }
-        if v != cur_line {
-            if cur_line != i32::MIN {
-                row_hashes.push(rh);
-            }
-            cur_line = v;
-            rh = 0xcbf2_9ce4_8422_2325 ^ v as u64;
-        }
         let cell = indexed.cell;
-        hash_mix(&mut rh, raw_color_key(cell.fg));
-        hash_mix(&mut rh, raw_color_key(cell.bg));
-        hash_mix(&mut rh, cell.flags.bits() as u64);
-        hash_mix(&mut rh, cell.c as u64 ^ (p.column.0 as u64) << 24);
         cells.push((
             p,
             CellSnap { c: cell.c, fg: cell.fg, bg: cell.bg, flags: cell.flags },
         ));
     }
-    if cur_line != i32::MIN {
-        row_hashes.push(rh);
-    }
     TermSnapshot {
         cells,
-        row_hashes,
         offset,
         cursor_point: content.cursor.point,
         cursor_shape: content.cursor.shape,
@@ -168,17 +141,6 @@ static ECHO_MAX_MS: AtomicU32 = AtomicU32::new(0);
 fn latency_debug() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("TUIPM_LATENCY_DEBUG").is_ok())
-}
-
-/// 终端一行的渲染缓存（指纹不变则整行重放）。
-#[derive(Default)]
-pub struct RowCache {
-    /// 行内容指纹（仅原始字段；不含主题/几何/选区，那些在 row_cache_sig 里）。
-    pub hash: u64,
-    /// 本行的背景 Shape（已按 run 合并）。
-    pub bg: Vec<egui::Shape>,
-    /// 本行 galley 回落字形的 Shape（GPU quad 不在此处）。
-    pub fg: Vec<egui::Shape>,
 }
 
 /// 一个在应用内页签中运行的终端会话。
@@ -343,23 +305,14 @@ pub struct Session {
     pub cached_ansi_rgb: Option<[egui::Color32; 256]>,
     /// 索引色「解析 + 主题适配」预烘焙表（fg/bg 各 256 项）。
     pub cached_color_lut: Option<([egui::Color32; 256], [egui::Color32; 256])>,
-    /// 上一帧快照对应的 parse_gen：用于检测 snapshot 是否有新内容，跳过无变化帧的重渲染。
+/// 上一帧快照对应的 parse_gen：快照内容未变时复用上面的 ANSI / 索引色 LUT。
     pub last_snapshot_gen: u64,
     /// 上一帧快照偏移：仅 offset 变化时做 O(rows) 的 point.line 平移，
     /// 避免 O(rows×cols) 的全量 clone。
     pub last_snapshot_offset: usize,
     /// 缓存的字体度量：(cell_w, cell_h, ppp)。字号/DPI 不变时跳过 fonts_mut 查询。
     pub cached_metrics: Option<(f32, f32, f32)>,
-    /// 静止帧缓存：完整渲染结果（bg_shapes + GPU mesh + fg_shapes），
-    /// snapshot_changed=false 时直接重放，跳过逐格渲染循环。
-pub cached_render_shapes: Option<Vec<egui::Shape>>,
-    /// 行级渲染缓存：每行内容指纹 + 该行的背景 Shape + galley 回落字形。
-    /// 流式输出时只有一两行变，其余行直接重放，不再重跑逐格循环。
-    pub row_cache: Vec<RowCache>,
-    /// 生成 row_cache 时的帧参数指纹（主题/几何/选区/字体图集世代）；与当前
-    /// 帧不一致则整份缓存作废。
-    pub row_cache_sig: u64,
-    /// GPU 字形批渲染状态：None = 未初始化或初始化失败（整格走 galley 回落）。
+/// GPU 字形批渲染状态：None = 未初始化或初始化失败（整格走 galley 回落）。
     /// 字形位图与纹理全进程共享（见 term_gl::SHARED_ATLASES），本字段只留
     /// 本页签私有的帧缓冲，多页签不再各占一份 4MB 图集。
     pub gpu: Option<crate::term_gl::TermGpu>,
@@ -1057,8 +1010,7 @@ let reader_ctx = ctx.clone();
     }
     // 快照 + 命令通道
     let snapshot = Arc::new(std::sync::Mutex::new(Arc::new(TermSnapshot {
-        cells: Vec::new(),
-        row_hashes: Vec::new(),
+cells: Vec::new(),
         offset: 0,
         cursor_point: Point::new(Line(0), Column(0)),
         cursor_shape: CursorShape::Block,
@@ -1613,10 +1565,7 @@ guard_ctx.request_repaint();
         last_preedit: String::new(),
         cached_ansi_rgb: None,
         cached_color_lut: None,
-        cached_metrics: None,
-cached_render_shapes: None,
-        row_cache: Vec::new(),
-        row_cache_sig: 0,
+cached_metrics: None,
         last_snapshot_gen: 0,
         last_snapshot_offset: 0,
         loading,
@@ -1695,8 +1644,7 @@ let cur_gen = sess.parse_gen.load(Ordering::Relaxed);
     *sess.snapshot.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(snap);
     sess.cells_stale.store(false, Ordering::Relaxed);
     sess.last_snapshot_gen = cur_gen;
-    sess.last_snapshot_offset = offset_val;
-sess.cached_render_shapes = None;
+sess.last_snapshot_offset = offset_val;
 }
 
 #[cfg(test)]
@@ -1861,9 +1809,7 @@ use super::*;
         assert!(snap.cells.iter().any(|(_, c)| c.c == 'i'));
     }
 
-/// 行级增量渲染的前置假设：快照 cells 必须按 vline（point.line.0 + offset）
-    /// 升序排列，且 vline 0 就是首行。terminal.rs 按行切分区间的 while 循环
-    /// 只靠这个序，序乱 = 整屏错位。
+/// 渲染端按行切分区间的 while 循环只靠这个序，序乱 = 整屏错位。
     #[test]
     fn snapshot_cells_are_vline_ascending() {
         let listener = SessionListener {
@@ -1895,37 +1841,6 @@ use super::*;
         }
         let got: Vec<(i32, char)> = heads.iter().map(|(k, ch)| (*k, *ch)).collect();
 assert_eq!(got, vec![(0, 'A'), (1, 'B'), (2, 'C')], "vline0 必须是首行");
-    }
-
-    /// 快照自带的行指纹：渲染端按它判行级增量（不再自己扫全屏格）。守卫性质：
-    /// 内容不变 → 指纹逐行不变；改一格 → 只影响那一行。
-    #[test]
-    fn snapshot_row_hashes_track_content() {
-        fn mk() -> Term<SessionListener> {
-            let listener = SessionListener {
-                redraw: std::sync::mpsc::sync_channel(1).0,
-                ctx: eframe::egui::Context::default(),
-                foreground: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            };
-            let mut term = Term::new(Config::default(), &TermSize::new(4, 3), listener);
-            let mut p: Processor = Default::default();
-            for row in ["AAA", "BBB", "CCC"] {
-                p.advance(&mut term, row.as_bytes());
-                p.advance(&mut term, b"\r\n");
-            }
-            term
-        }
-        let a = build_snapshot(&mk(), 1);
-        assert_eq!(a.row_hashes.len(), 3, "行数应等于可视行数");
-        let b = build_snapshot(&mk(), 2);
-        assert_eq!(a.row_hashes, b.row_hashes, "内容相同 → 指纹相同");
-        let mut c = mk();
-        let mut p: Processor = Default::default();
-        p.advance(&mut c, b"\x1b[2;2HX"); // 只改第 2 行第 2 列
-        let s = build_snapshot(&c, 3);
-        assert_eq!(s.row_hashes[0], a.row_hashes[0], "未变行不应被牵连");
-        assert_ne!(s.row_hashes[1], a.row_hashes[1], "改动行指纹必须变");
-        assert_eq!(s.row_hashes[2], a.row_hashes[2], "未变行不应被牵连");
     }
 
     /// DSR/DA 必须应答：本机实测（裸 ConPTY + cmd.exe，捆绑 conpty 1.25 与系统

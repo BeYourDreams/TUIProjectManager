@@ -43,11 +43,11 @@ const INTERACT_FRAME_MS: u64 = 16;
 
 /// 滚轮期间的帧间隔（~20 FPS）。单独一档，不跟着打字走 60 FPS：
 /// 滚动是唯一一种「每帧都付全价」的操作——每个滚轮事件都要滚动仿真器缓冲 +
-/// `build_snapshot` 全屏重建，且行指纹种子含 vline ⇒ 滚动必然让整屏行缓存作废
-/// 逐格重渲染。锁改成非阻塞（try_wlock）之后不再卡死，但 60 FPS 下这活每秒干
-/// 60 遍纯属浪费：滚动本身是离散档位，一格 = 一次翻页，20 FPS 看不出区别
+/// `build_snapshot` 全屏重建 + 终端逐格重渲染。锁改成非阻塞（try_wlock）之后不再卡死，
+/// 但 60 FPS 下这活每秒干 60 遍纯属浪费：滚动本身是离散档位，一格 = 一次翻页，
+/// 20 FPS 看不出区别
 /// （这正是 10.05.0001 之前的行为量级，它不卡）。
-/// ponytail: 觉得滚轮发涩就调到 33（30 FPS）；再往上就该去治行缓存的失效口径。
+/// ponytail: 觉得滚轮发涩就调到 33（30 FPS）；再往上先给 build_snapshot 上缓存。
 const SCROLL_FRAME_MS: u64 = 50;
 
 /// 帧间隔决策：滚轮 > 交互活跃 > 输出在途 > 全静止。纯函数，便于自检。
@@ -5698,10 +5698,9 @@ let s = TAB_GAP;
             if let Tab::Session(s) = tab {
                 s.theme_dark
                     .store(dark, std::sync::atomic::Ordering::Relaxed);
-                // 无布局缓存后可免清理：galley 每帧现排（见 terminal.rs 渲染循环），
-                // 只作废帧重放与 ANSI 回写缓存。
+// 无布局缓存后可免清理：galley 每帧现排（见 terminal.rs 渲染循环），
+                // 只作废 ANSI 回写缓存。
                 s.caret_scan = None;
-                s.cached_render_shapes = None;
                 s.cached_ansi_rgb = None;
                 // 索引色烘焙表取 adapt_*(dark)：主题切换时必须作废，
                 // 否则深/浅适配的旧表会钉住新主题的颜色。
@@ -8352,9 +8351,8 @@ impl eframe::App for ClientApp {
             if std::time::Instant::now() >= t {
                 self.theme_settle_at = None;
                 for tab in &mut self.tabs {
-                    if let Tab::Session(s) = tab {
+if let Tab::Session(s) = tab {
                         s.caret_scan = None;
-                        s.cached_render_shapes = None;
                         s.cached_ansi_rgb = None;
                     }
                 }

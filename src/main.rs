@@ -220,10 +220,7 @@ fn main() -> eframe::Result {
     }));
     unlock_exe();
     ensure_toast_registered();
-log_crash(
-        "start",
-        &format!("v{} renderer={:?}", app_version(), if prefer_glow() { "glow" } else { "wgpu" }),
-    );
+log_crash("start", &format!("v{}", app_version()));
     let config = config::load();
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1100.0, 720.0])
@@ -238,110 +235,36 @@ log_crash(
     if config.window.maximized {
         viewport = viewport.with_maximized(true);
     }
-    let renderer = if prefer_glow() {
-        eframe::Renderer::Glow
-    } else {
-        eframe::Renderer::Wgpu
-    };
-    let mut options = eframe::NativeOptions {
-        renderer,
+// 不指定 renderer、不指定 backends、不指定适配器：全交给系统。
+    // eframe 默认 = wgpu，后端集合 `Backends::PRIMARY | GL`（Windows 上就是
+    // DX12 → Vulkan → GL 依序试），适配器由 wgpu 按 power preference 挑（独显
+    // → 核显 → WARP：系统自带的 CPU 软件光栅器）。程序不查显卡、不写死 DX 版本，
+    // 只负责告诉系统「该画了」（ctx.request_repaint）。
+    // ponytail: 某台机器上厂商 ICD 一加载就崩（Intel 老 igvk64.dll）时，别改代码，
+    // 设 `WGPU_BACKENDS=dx12` 即可（egui-wgpu 原生读这个环境变量）。
+    let options = eframe::NativeOptions {
         viewport,
         ..Default::default()
     };
-    #[cfg(windows)]
-    if renderer == eframe::Renderer::Wgpu
-        && let eframe::egui_wgpu::WgpuSetup::CreateNew(create_new) =
-            &mut options.wgpu_options.wgpu_setup
-    {
-        create_new.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
-    }
     let title = format!("TUI 项目管理器 v{}", app_version());
-    // DX12 不可用（如 Win7/无 DX12 驱动）时 wgpu 初始化返回 Err → 自动回退 glow，
-    // 避免“启动不了”。失败的 Err 分支不吞掉：仍会向上传播。
-    let mut glow_fallback = options.clone();
-    glow_fallback.renderer = eframe::Renderer::Glow;
+    // 系统图形栈整个起不来时的最后一道保险：换 glow（OpenGL 3.3+，覆盖面比
+    // wgpu 老一些的驱动）。是失败后的重试，不是启动前替系统做选择。
+    let glow_fallback = eframe::NativeOptions {
+        renderer: eframe::Renderer::Glow,
+        ..options.clone()
+    };
     match eframe::run_native(&title, options, Box::new(create_app)) {
         Ok(()) => Ok(()),
-        Err(err) if renderer == eframe::Renderer::Wgpu => {
+        Err(err) => {
             // 无控制台可看时记入 crash.log（与 panic 钩子同一目录）
-            eprintln!("[wgpu] 初始化失败，自动回退 glow：{err}");
+            eprintln!("[renderer] wgpu 初始化失败，回退 glow：{err}");
+            log_crash("renderer", &format!("wgpu failed: {err}"));
             eframe::run_native(&title, glow_fallback, Box::new(create_app))
         }
-        Err(err) => Err(err),
     }
 }
 
-//// 渲染后端选择：AMD/NVIDIA 默认 glow（同帧输出，内存比 DX12 省 ~200MB）；
-/// Intel iGPU 走 wgpu/DX12——其 OpenGL/Vulkan 老驱动会闪退（ig9icd64.dll /
-/// igvk64.dll，0xc0000005），DX12 用微软运行时+厂商驱动可绕开。
-/// TPM_RENDERER=glow|wgpu 显式强制，跳过检测。
-fn prefer_glow() -> bool {
-    match std::env::var("TPM_RENDERER").as_deref() {
-        Ok("glow") => return true,
-        Ok("wgpu") => return false,
-        _ => {}
-    }
-    #[cfg(target_os = "windows")]
-    {
-        // 先读缓存：WMI 查询要起 PowerShell，启动时同步跑会卡 200~800ms。
-        // 缓存位于 config 目录，7 天过期；缓存缺失/过期才同步查一次并回写。
-        let cache = crate::config::config_path()
-            .parent()
-            .map(|d| d.join("renderer.cache"));
-        if let Some(p) = cache.as_ref()
-            && let Ok(meta) = std::fs::metadata(p)
-            && meta.modified().ok().and_then(|t| t.elapsed().ok()).map(|e| e.as_secs() < 7 * 24 * 3600).unwrap_or(false)
-            && let Ok(s) = std::fs::read_to_string(p)
-        {
-            let s = s.trim();
-            if s == "glow" {
-                return true;
-            }
-            if s == "wgpu" {
-                return false;
-            }
-        }
-
-        use std::os::windows::process::CommandExt;
-        // wgpu::Instance::new() 在本机（Intel UHD 630 + AMD 混合）无窗口句柄下建即崩
-        // （0xc0000005），枚举更会加载老 Intel igvk64.dll 闪退，catch_unwind 都抓不住。
-        // 改用 WMI 纯文本查询（与 toast 同款 powershell 调用）：只读系统信息，
-        // 不加载任何 GPU 驱动。Intel 现像卡 → wgpu/DX12，否则 glow。
-        // 检测失败 → 当 Intel 处理 → 老 wgpu/DX12 稳妥路径（glow 只是省内存的优化，
-        // 拿不准时宁能不优化不能崩）。
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let script = "Get-CimInstance Win32_VideoController | %{ $_.Name }";
-        let names = match std::process::Command::new("powershell")
-            .creation_flags(CREATE_NO_WINDOW)
-            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", script])
-            .output()
-        {
-            Ok(o) => String::from_utf8_lossy(&o.stdout).to_ascii_lowercase(),
-            Err(_) => String::new(),
-        };
-        let has_intel = names.contains("intel");
-        let has_discrete =
-            names.contains("nvidia") || names.contains("geforce") || names.contains("amd")
-                || names.contains("radeon");
-        // 有独显（AMD/NVIDIA）→ glow：独显 OGL 驱动稳定，兼省显存。
-        // 纯 Intel / 未知 → wgpu/DX12：集显老 OGL 驱动会闪退（ig9icd64.dll），
-        // DX12 用微软运行时+厂商驱动绕开；检测失败宁可不优化不能崩。
-        let glow = !has_intel || has_discrete;
-        if let Some(p) = cache.as_ref() {
-            if let Some(parent) = p.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(p, if glow { "glow" } else { "wgpu" });
-        }
-        glow
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        true
-    }
-}
-
-/// 创建应用实例；run_native 可能调用两次（wgpu 失败回退 glow）。
+/// 创建应用实例；run_native 可能调用两次（默认图形栈失败后回退 glow）。
 fn create_app(
     cc: &eframe::CreationContext<'_>,
 ) -> Result<Box<dyn eframe::App>, Box<dyn std::error::Error + Send + Sync>> {

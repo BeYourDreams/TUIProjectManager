@@ -7,9 +7,10 @@ edition = "2024"
 alacritty_terminal = "0.26"
 # 读剪贴板 CF_HDROP（资源管理器复制文件后的文件列表）；已是 arboard 的传递依赖，直接声明零新增编译。
 clipboard-win = "5.4"
-# 渲染后端：默认 wgpu（Windows 走 DX12），Intel 老 iGPU 的 OpenGL/Vulkan 驱动
-# 会闪退（ig9icd64.dll / igvk64.dll），必须 DX12；AMD/NVIDIA 由 main.rs 启动时
-# 自动选 glow（OpenGL，内存比 DX12 省 ~200MB），TPM_RENDERER=glow|wgpu 可强制。
+# 渲染后端：renderer 与 backends 全不指定，交给系统。eframe 默认走 wgpu，
+# 后端集合 PRIMARY|GL（Windows 上 DX12 → Vulkan → GL 依序试），适配器由 wgpu
+# 挑（独显 → 核显 → WARP，即系统自带的 CPU 软件光栅器）。glow 只作 wgpu 整个
+# 起不来时的重试路径。某台机器上厂商 ICD 一加载就崩时设 WGPU_BACKENDS=dx12。
 # 不启 default_fonts（省 Ubuntu+NotoEmoji ~15MB）：基础字体用内嵌 HACK，见 setup_fonts。
 eframe = { version = "0.36.1", default-features = false, features = ["glow", "wgpu"] }
 fontdue = "0.9"
