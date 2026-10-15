@@ -1778,7 +1778,7 @@ let default_fg = color_for(dark, Color32::WHITE, Color32::BLACK);
     // ── 全量绘制：不缓存帧/行，整屏逐格重跑，GPU 字形网格每帧整体重建。 ──
     // ponytail: 曾按行内容指纹复用上一帧 Shape + 逐行顶点 memcpy 做过增量绘制，
     // 作废口径（主题/几何/选区/图集世代）一旦错位就是整行串位，而整屏重画只
-    // 多花 rows×cols 次迭代 —— 帧率锁 10 FPS，划算。真卡再加，届时先上 profiler。
+// 多花 rows×cols 次迭代 —— 帧率有上限（≤30 FPS），划算。真卡再加，届时先上 profiler。
     let mut bg_shapes: Vec<egui::Shape> = Vec::with_capacity(rows * 8);
     let mut fg_shapes: Vec<egui::Shape> = Vec::new();
     // 本帧图集访问权：共享图集帧级加锁一次（单 UI 线程零竞争），页签私有

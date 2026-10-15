@@ -132,9 +132,30 @@ pub struct Settings {
     /// 目录下的 pi / opencode 路径，用户可在设置页增删（换机器就改这里）。
     #[serde(default)]
     pub tool_paths: Vec<String>,
-    /// 上面都找不到时，是否再扫 PATH。默认 true。
+/// 上面都找不到时，是否再扫 PATH。默认 true。
     #[serde(default = "default_true")]
     pub tool_search_path: bool,
+    /// 首页项目排序方式（记住上次选择）。
+    #[serde(default)]
+    pub project_sort: ProjectSort,
+    /// 首页是否显示隐藏项目（记住上次选择）。
+    #[serde(default)]
+    pub show_hidden: bool,
+}
+
+/// 首页项目列表排序模式。升/降序仅作用于显示层（按名称首字），不修改
+/// config 里的原始数据；「默认顺序」展示原始数据顺序，自定义排序通过拖拽
+/// 重排完成（会持久化修改原始数据）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectSort {
+    /// 原始数据顺序（可拖拽自定义重排）。
+    #[default]
+    Default,
+    /// 按名称首字升序，仅显示层排序。
+    NameAsc,
+    /// 按名称首字降序，仅显示层排序。
+    NameDesc,
 }
 
 impl Default for Settings {
@@ -145,8 +166,10 @@ impl Default for Settings {
             dark_mode: true,
             follow_system: false,
             history_lines: default_history_lines(),
-            tool_paths: Vec::new(),
+tool_paths: Vec::new(),
             tool_search_path: true,
+            project_sort: ProjectSort::default(),
+            show_hidden: false,
         }
     }
 }
@@ -815,6 +838,21 @@ mod tests {
         // 默认值与 pi 侧本地网关一致。
         let d = OcProvider::default();
         assert_eq!(d.npm, "@ai-sdk/openai-compatible");
-        assert_eq!(d.base_url, "http://localhost:20128/v1");
+assert_eq!(d.base_url, "http://localhost:20128/v1");
+    }
+
+    /// 项目排序与「显示隐藏项目」跨重启保留；旧配置没这两字段时回落默认值。
+    #[test]
+    fn settings_round_trip_project_sort_and_show_hidden() {
+        let mut s = Settings::default();
+        s.project_sort = ProjectSort::NameDesc;
+        s.show_hidden = true;
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.project_sort, ProjectSort::NameDesc);
+        assert!(back.show_hidden);
+        let old: Settings = serde_json::from_str(r#"{"tui_commands":["nvim"]}"#).unwrap();
+        assert_eq!(old.project_sort, ProjectSort::Default);
+        assert!(!old.show_hidden);
     }
 }

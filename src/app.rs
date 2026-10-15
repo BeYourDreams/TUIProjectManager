@@ -8,7 +8,7 @@ use std::time::Instant;
 use eframe::egui;
 use egui::{Color32, RichText};
 
-use crate::config;
+use crate::config::{self, ProjectSort};
 use crate::session::{self, Session};
 use crate::terminal;
 
@@ -32,34 +32,45 @@ const IDLE_HEARTBEAT_MS: u64 = 500;
 /// 回归 3 次，见 921f062/0ae5904）。根治 = 锁死 10 FPS，杜绝再被调高。
 const BUSY_FRAME_MS: u64 = 100;
 
-/// 交互活跃时的帧间隔（~60 FPS）：打字回显、滚轮、拖选、按键按住是卡顿唯一
+/// 交互活跃时的帧间隔（~30 FPS）：打字回显、滚轮、拖选、按键按住是卡顿唯一
 /// 能被感知的位置（输出在途时反而 100ms 足够，流式字块按 10 FPS 跳出不违和）。
+/// 这是**全程序帧率上限**（页签锁 30 FPS）：其余各档都比它慢，改它就是改上限。
 /// 与上面那条悬停激活矛盾不冲突：键盘/滚轮/鼠标按下这些事件本身就先把窗口
 /// 激活了，悬停激活根本没在发生；而「无输入、只输出」的场景仍走 BUSY_FRAME_MS，
 /// 那才是悬停会失效的窗口。
-/// ponytail: 交互帧率上限 = 16ms（显示刷新率）；若将来帧间隔还需更快，
-/// 上限提到本常量即可，不涉及渲染路径改动。
-const INTERACT_FRAME_MS: u64 = 16;
+/// ponytail: 想提到 60 FPS 只把本常量改回 16（= 显示刷新率上限），不涉渲染路径。
+const INTERACT_FRAME_MS: u64 = 33;
 
-/// 滚轮期间的帧间隔（~20 FPS）。单独一档，不跟着打字走 60 FPS：
-/// 滚动是唯一一种「每帧都付全价」的操作——每个滚轮事件都要滚动仿真器缓冲 +
-/// `build_snapshot` 全屏重建 + 终端逐格重渲染。锁改成非阻塞（try_wlock）之后不再卡死，
-/// 但 60 FPS 下这活每秒干 60 遍纯属浪费：滚动本身是离散档位，一格 = 一次翻页，
-/// 20 FPS 看不出区别
-/// （这正是 10.05.0001 之前的行为量级，它不卡）。
-/// ponytail: 觉得滚轮发涩就调到 33（30 FPS）；再往上先给 build_snapshot 上缓存。
-const SCROLL_FRAME_MS: u64 = 50;
+/// 本帧窗口是**被鼠标点回前台**的（则当前页签的 ✅ 该抹掉）。
+///
+/// 焦点变化一律不算「已查看」（terminal.rs user_interacted）：Alt-Tab / 键盘切回
+/// 只是把窗口亮回来，人可能压根没在看屏幕，抹掉 ✅ 等于白亮。
+/// 但「用鼠标点一下把它拉回前台」是明确的人为动作，就该抹。区分方法：winit 一次
+/// 事件泵里把 `WindowFocused(true)` 和这次点击的指针事件排在同一帧（Windows 先发
+/// WM_ACTIVATE 再发鼠标消息），同帧出现才算。只认按下/滚轮，不认 PointerMoved
+/// （鼠标只是扫过窗口也会带焦点事件）。
+fn window_activated_by_mouse(ctx: &egui::Context) -> bool {
+    ctx.input(|i| activated_by_mouse_events(&i.events))
+}
 
-/// 帧间隔决策：滚轮 > 交互活跃 > 输出在途 > 全静止。纯函数，便于自检。
-/// busy 里的 10 FPS 不是拍脑袋：无输入的持续高帧率重绘实测干扰 Windows 悬停
-/// 激活窗口（30 FPS 失效、10 正常，见 921f062/0ae5904），所以帧率只对「窗口
-/// 已被激活」的时刻放开。要更高输出帧率先根治那个干扰源，再动 BUSY_FRAME_MS。
-/// scrolling 排在 interacting 之前：滚动与打字重叠时也要按住 20 FPS 不放，
-/// 否则拖动选区+滚轮同开就能把帧率顶回 60。
-fn frame_delay_ms(interacting: bool, scrolling: bool, busy: bool) -> u64 {
-    if scrolling {
-        SCROLL_FRAME_MS
-    } else if interacting {
+/// [`window_activated_by_mouse`] 的纯函数芯（可单测）。
+fn activated_by_mouse_events(events: &[egui::Event]) -> bool {
+    events.iter().any(|e| matches!(e, egui::Event::WindowFocused(true)))
+        && events.iter().any(|e| {
+            matches!(
+                e,
+                egui::Event::PointerButton { .. } | egui::Event::MouseWheel { .. }
+            )
+        })
+}
+
+/// 帧间隔决策：交互活跃（打字 **或** 滚动，不分档）> 输出在途 > 全静止。纯函数，便于自检。
+/// 最快档 = 33ms，即**页签帧率锁 30 FPS**；busy 里的 10 FPS 不是拍脑袋：无输入
+/// 的持续高帧率重绘实测干扰 Windows 悬停激活窗口（30 FPS 失效、10 正常，见
+/// 921f062/0ae5904），所以帧率只对「窗口已被激活」的时刻放开。要更高输出
+/// 帧率先根治那个干扰源，再动 BUSY_FRAME_MS。
+fn frame_delay_ms(interacting: bool, busy: bool) -> u64 {
+    if interacting {
         INTERACT_FRAME_MS
     } else if busy {
         BUSY_FRAME_MS
@@ -3212,19 +3223,6 @@ fn dir_exists(cache: &mut HashMap<String, (bool, Instant)>, path: &str) -> bool 
     cache.insert(path.to_string(), (ok, now));
     ok
 }
-/// 首页项目列表排序模式。升/降序仅作用于显示层（按名称首字），
-/// 不修改 config 里的原始数据；「默认顺序」展示原始数据顺序，
-/// 自定义排序通过拖拽重排完成（会持久化修改原始数据）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectSort {
-    /// 原始数据顺序（可拖拽自定义重排）。
-    Default,
-    /// 按名称首字升序，仅显示层排序。
-    NameAsc,
-    /// 按名称首字降序，仅显示层排序。
-    NameDesc,
-}
-
 /// 后台 spawn 完成的结果消息：(result, is_restore, saved_index)。
 /// saved_index 仅恢复时有效（保存时的 dirs 索引），用于按原序插入页签。
 type SpawnResult = (Result<Session, String>, bool, Option<usize>);
@@ -3362,12 +3360,8 @@ pub struct ClientApp {
     model_num_edit: Option<(usize, String, usize, String, String)>,
     /// 后台重绘跳帧计数器：后台页签收到 redraw 信号时累计，达到跳帧阈值才真正重绘。
     bg_frame: u64,
-    /// 首页项目列表搜索过滤文本。
+/// 首页项目列表搜索过滤文本。
     search_query: String,
-    /// 首页是否显示已隐藏的项目。
-    show_hidden: bool,
-    /// 首页项目列表排序模式（显示层排序，不修改原始数据）。
-    project_sort: ProjectSort,
     /// 待异步重新启动/切换命令的页签。
     pending_relaunch: Vec<PendingRelaunch>,
     /// 本帧的滚轮输入（raw_input_hook 统计原始事件，见 terminal::Wheel）。
@@ -3977,9 +3971,7 @@ restore_active: None,
             provider_name_edit: None,
             model_num_edit: None,
             bg_frame: 0,
-            search_query: String::new(),
-            show_hidden: false,
-            project_sort: ProjectSort::Default,
+search_query: String::new(),
             pending_relaunch: Vec::new(),
             wheel: terminal::Wheel::default(),
         };
@@ -5847,29 +5839,31 @@ let s = TAB_GAP;
                             .desired_width(ui.available_width() - 70.0)
                             .hint_text("搜索项目名/目录..."),
                     );
-                    let label = match self.project_sort {
+let label = match self.config.settings.project_sort {
                         ProjectSort::Default => "默认顺序",
                         ProjectSort::NameAsc => "名称升序",
                         ProjectSort::NameDesc => "名称降序",
                     };
                     if ui.button(label).clicked() {
-                        self.project_sort = match self.project_sort {
+                        self.config.settings.project_sort = match self.config.settings.project_sort {
                             ProjectSort::Default => ProjectSort::NameAsc,
                             ProjectSort::NameAsc => ProjectSort::NameDesc,
                             ProjectSort::NameDesc => ProjectSort::Default,
                         };
+                        self.persist_config();
                     }
                 });
                 // 隐藏项目切换
                 let hidden_count = self.config.projects.iter().filter(|p| p.hidden).count();
                 if hidden_count > 0 {
-                    let label = if self.show_hidden {
+let label = if self.config.settings.show_hidden {
                         format!("隐藏项目 ({hidden_count}) - 点击隐藏")
                     } else {
                         format!("显示隐藏项目 ({hidden_count})")
                     };
                     if ui.button(label).clicked() {
-                        self.show_hidden = !self.show_hidden;
+                        self.config.settings.show_hidden = !self.config.settings.show_hidden;
+                        self.persist_config();
                     }
                 }
                 ui.separator();
@@ -5883,7 +5877,7 @@ let s = TAB_GAP;
                     .iter()
                     .enumerate()
                     .filter(|(_, p)| {
-                        if !self.show_hidden && p.hidden { return false; }
+if !self.config.settings.show_hidden && p.hidden { return false; }
                         if query.is_empty() { return true; }
                         p.name.to_lowercase().contains(&query)
                             || p.path.to_lowercase().contains(&query)
@@ -5893,7 +5887,7 @@ let s = TAB_GAP;
                 // 升/降序仅作用于显示层：按名称首字排序 filtered_indices（原始索引），
                 // 无论何种排序都不改动 config.projects —— 自定义顺序仍由拖拽重排单独完成。
                 let mut display_indices = filtered_indices;
-                match self.project_sort {
+match self.config.settings.project_sort {
                     ProjectSort::Default => {}
                     ProjectSort::NameAsc => display_indices.sort_by(|&a, &b| {
                         self.config.projects[a]
@@ -6008,7 +6002,7 @@ let s = TAB_GAP;
                             });
                             // 拖动悬浮帧：记录源索引；行矩形供落位定位。
                             // 升/降序视图下显示顺序与原始数据不一致，禁用拖拽重排。
-                            if resp.dragged() && self.project_sort == ProjectSort::Default {
+                            if resp.dragged() && self.config.settings.project_sort == ProjectSort::Default {
                                 drag_index = Some(i);
                             }
                             row_rects.push((i, resp.rect));
@@ -6035,13 +6029,13 @@ let s = TAB_GAP;
                 // 拖动状态跨帧保存在 self.drag_project：拖动中的每一帧刷新源索引，
                 // 松手帧（dragged() 已变 false）靠它仍拿得到 from。
                 // 升/降序视图下显示顺序与原始数据不一致，禁用拖拽重排。
-                if self.project_sort != ProjectSort::Default {
+                if self.config.settings.project_sort != ProjectSort::Default {
                     drag_index = None;
                 }
                 if let Some(i) = drag_index {
                     self.drag_project = Some(i);
                 }
-                if self.project_sort == ProjectSort::Default
+                if self.config.settings.project_sort == ProjectSort::Default
                     && let Some(from) = self.drag_project
                 {
                     let pointer = ui.ctx().pointer_interact_pos();
@@ -8219,6 +8213,15 @@ impl eframe::App for ClientApp {
             }
         }
 
+// 鼠标把窗口激活回来 = 「人正看着当前页签」→ 抹掉当前页签 ✅（纯函数，见
+        // window_activated_by_mouse 的注释）。与 terminal.rs user_interacted 挡掉的
+        // 「失焦/回焦不算看过」互补：Alt-Tab / 键盘切回依旧不清，鼠标点回才清。
+        if window_activated_by_mouse(ctx)
+            && let Some(Tab::Session(s)) = self.tabs.get(self.current)
+        {
+            s.has_been_viewed.store(true, Ordering::Relaxed);
+        }
+
 // 「已查看」同时管 ✅ 图标与**系统通知**：真实交互一到就把 ✅ 清成空
         // （tab_icon_from_snap 每帧直读，立刻生效）。它只由**真实交互**置位：点/切页签
         // （TabAction::Activate、Ctrl+Tab）、在终端里点击/选中/滚轮/打字（terminal.rs
@@ -8269,17 +8272,16 @@ let mut busy = self.downloading
             || ctx.input(|i| i.pointer.any_down());
 // 交互活跃：最近有键盘/IME/粘贴输入，或 500ms 内有滚轮。优先级高于
         // busy（输出在途时也先保证回显跟手）。
-        let now_ms = crate::now_ms();
-        let (mut interacting, scrolling) = self.tabs.get(self.current).map_or((false, false), |t| {
-            let Tab::Session(s) = t else { return (false, false) };
+let now_ms = crate::now_ms();
+        // 打字与滚轮不分开档：一有活动就按全局最快帧（INTERACT_FRAME_MS）。
+        let mut interacting = self.tabs.get(self.current).is_some_and(|t| {
+            let Tab::Session(s) = t else { return false };
             let li = s.last_input_ms.load(Ordering::Relaxed);
             let ls = s.last_scroll_ms.load(Ordering::Relaxed);
-            (
-                li != 0 && now_ms.saturating_sub(li) < INPUT_ACTIVE_MS,
-                ls != 0 && now_ms.saturating_sub(ls) < SCROLL_ECHO_MS,
-            )
+            (li != 0 && now_ms.saturating_sub(li) < INPUT_ACTIVE_MS)
+                || (ls != 0 && now_ms.saturating_sub(ls) < SCROLL_ECHO_MS)
         });
-        // Ctrl/⌘ 按住期间强制 60 FPS：终端里靠**物理 V 键状态**认 Ctrl+V 手势
+// Ctrl/⌘ 按住期间强制最快档（30 FPS）：终端里靠**物理 V 键状态**认 Ctrl+V 手势
         // （文件剪贴板时 egui 一个事件都不给，见 terminal.rs v_key_down），
         // 全靠帧采样。IDLE 500ms 心跳会跳过 ~100ms 的一次轻点，Ctrl+V 偶发
         // 粘不上；按住 Ctrl 本来就是「人正在按键」，也算交互。
@@ -8304,7 +8306,7 @@ let mut busy = self.downloading
                 }
             }
         }
-let delay_ms = frame_delay_ms(interacting, scrolling, busy);
+let delay_ms = frame_delay_ms(interacting, busy);
         ctx.request_repaint_after(std::time::Duration::from_millis(delay_ms));
         self.bg_frame = self.bg_frame.wrapping_add(1);
 
@@ -9172,28 +9174,60 @@ fn scrolling_does_not_count_as_update() {
 }
 #[cfg(test)]
 mod frame_delay_tests {
-    use super::{frame_delay_ms, BUSY_FRAME_MS, IDLE_HEARTBEAT_MS, INTERACT_FRAME_MS, SCROLL_FRAME_MS};
+use super::{frame_delay_ms, BUSY_FRAME_MS, IDLE_HEARTBEAT_MS, INTERACT_FRAME_MS};
+    use eframe::egui;
 
-    /// 帧间隔优先级：滚轮 > 交互 > 输出在途 > 全静止。顺序错了就是两个真实故障：
-    /// 交互判据排在 busy 之后 → 输出时打字回显仍按 100ms（延迟感）；
+/// 帧间隔优先级：交互（打字或滚动，不分档）> 输出在途 > 全静止。顺序错了就是
+    /// 两个真实故障：交互判据排在 busy 之后 → 输出时打字回显仍按 100ms（延迟感）；
     /// busy 与静止混为一谈 → 输出在途时落回 500ms 心跳（字块跳成慢动作）。
-    /// 滚轮排在最前 → 拖选+滚轮同开就把帧率顶回 60 FPS，全屏重建白干 60 次/秒。
     #[test]
-    fn priority_scroll_over_interact_over_busy_over_idle() {
-        assert_eq!(frame_delay_ms(false, false, true), BUSY_FRAME_MS);
-        assert_eq!(frame_delay_ms(false, false, false), IDLE_HEARTBEAT_MS);
-        assert_eq!(frame_delay_ms(true, false, true), INTERACT_FRAME_MS);
-        assert_eq!(frame_delay_ms(true, false, false), INTERACT_FRAME_MS);
-        assert_eq!(frame_delay_ms(false, true, true), SCROLL_FRAME_MS);
-        assert_eq!(frame_delay_ms(false, true, false), SCROLL_FRAME_MS);
-        // 滚动与打字重叠：仍按 20 FPS，不被 interacting 拉回 60。
-        assert_eq!(frame_delay_ms(true, true, true), SCROLL_FRAME_MS);
+    fn priority_interact_over_busy_over_idle() {
+        assert_eq!(frame_delay_ms(false, true), BUSY_FRAME_MS);
+        assert_eq!(frame_delay_ms(false, false), IDLE_HEARTBEAT_MS);
+        assert_eq!(frame_delay_ms(true, true), INTERACT_FRAME_MS);
+        assert_eq!(frame_delay_ms(true, false), INTERACT_FRAME_MS);
         assert!(
-            INTERACT_FRAME_MS < SCROLL_FRAME_MS
-                && SCROLL_FRAME_MS < BUSY_FRAME_MS
-                && BUSY_FRAME_MS < IDLE_HEARTBEAT_MS,
+            INTERACT_FRAME_MS < BUSY_FRAME_MS && BUSY_FRAME_MS < IDLE_HEARTBEAT_MS,
             "帧率档必须单调"
         );
+        // 页签锁 30 FPS：最快档 33ms，且没有任何一档快于它。
+        assert_eq!(INTERACT_FRAME_MS, 33, "帧率上限 = 30 FPS");
+    }
+
+    /// 鼠标点回前台 → 抹当前页签 ✅；Alt-Tab 切回（只有焦点事件）→ 保留。
+    #[test]
+    fn mouse_activated_window_clears_done_only_with_pointer() {
+        use super::activated_by_mouse_events;
+        let click = egui::Event::PointerButton {
+            pos: egui::pos2(10.0, 10.0),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        };
+        let wheel = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, 1.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::default(),
+        };
+        let move_only = egui::Event::PointerMoved(egui::pos2(1.0, 1.0));
+        assert!(activated_by_mouse_events(&[
+            egui::Event::WindowFocused(true),
+            click.clone()
+        ]));
+        assert!(activated_by_mouse_events(&[
+            egui::Event::WindowFocused(true),
+            wheel
+        ]));
+        // 只有焦点事件（Alt-Tab / 键盘切回）→ 不抹 ✅。
+        assert!(!activated_by_mouse_events(&[egui::Event::WindowFocused(true)]));
+        // 鼠标只是扫过窗口 → 不抹。
+        assert!(!activated_by_mouse_events(&[
+            egui::Event::WindowFocused(true),
+            move_only
+        ]));
+        // 失焦帧的点击不算（没拿到焦点）。
+        assert!(!activated_by_mouse_events(&[click]));
     }
 }
 
