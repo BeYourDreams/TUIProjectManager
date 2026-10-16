@@ -468,7 +468,7 @@ fn paste_file_paths(sess: &Session, files: &[String], status: &mut Option<String
         .collect();
     let _ = sess.writer.try_send(mapped.join(" ").into_bytes());
     // 粘贴文件路径同样是用户驱动的写入（TUI 会补全/回显路径），
-    // 记输入窗口，否则页签把它当成任务在跑。
+    // 记帧率交互窗口（与页签状态无关）。
     stamp_user_input(sess);
     *status = Some(if mapped.len() == 1 {
         format!("已粘贴文件相对路径：{}", mapped[0])
@@ -886,32 +886,10 @@ fn stamps_scroll_echo(action: &WheelScroll) -> bool {
 }
 
 /// 记「用户驱动的 PTY 写入」：键盘、点击/中键转发、粘贴文件路径这类写入都会
-/// 让 TUI 立刻回显重绘，reader 随之刷新 `last_output_ms` → 页签误亮 🔄。
-/// 统一走这一个入口，漏记就会退化成「用户一动就显示任务在跑」。
+/// 让 TUI 立刻回显重绘。仅供帧率调度判「交互活跃」（app.rs INPUT_ACTIVE_MS），
+/// **不参与**页签状态判定：回显与真输出同路，✅/🔄 只看终端输出。
 fn stamp_user_input(sess: &Session) {
     sess.last_input_ms.store(crate::now_ms(), Ordering::Relaxed);
-}
-
-/// 本帧是否发生了**真实交互**（决定当前页签的 ✅ 该不该抹掉）。
-///
-/// 不能只看 `!events.is_empty()`：窗口焦点变化（Alt-Tab、点别的程序再点回来）
-/// 与光标移动（鼠标扫过窗口、离开窗口）都会产生事件，可它们都不代表「人正
-/// 看着这个页签」。旧实现把这些也算已查看 → 窗口刚恢复到屏幕前的那一帧就把
-/// ✅ 抹掉，用户永远看不到失焦期间跑完的当前页签（页签栏、终端输入两条路都
-/// 记 viewed，只有这里挡一次）。
-///
-/// 判定取反列举：未知/新增事件默认算交互（维持旧行为，不因 egui 升级漏判）。
-fn user_interacted(events: &[egui::Event]) -> bool {
-    events.iter().any(|e| {
-        !matches!(
-            e,
-            egui::Event::WindowFocused(_)
-                | egui::Event::ModifiersChanged(_)
-                | egui::Event::PointerMoved(_)
-                | egui::Event::MouseMoved(_)
-                | egui::Event::PointerGone
-        )
-    })
 }
 
 /// 渲染一个终端会话（网格 + 光标），并把终端获得焦点时的键盘输入写回 PTY。
@@ -966,15 +944,10 @@ pub fn show_terminal(
     let perf = perf_on();
     let perf_t0 = std::time::Instant::now();
     let mut perf_f = PerfFrame::default();
-    // ── 交互即「已查看」：在终端里点击/拖选/右键/滚轮/打字/粘贴都算看过当前
-    // 页签 → 页签 ✅ 立刻清空（用户要求：当前页签也亮 ✅，一交互才消）。
-    // 焦点变化/光标移动不算交互（见 user_interacted）：否则失焦期间跑完的当前
-    // 页签，✅ 会在窗口恢复焦点的那一帧被抹掉，等于白亮。
-    // 记账点只此一处：键盘/IME/点击转发的精细时间戳仍走 stamp_user_input。
-    if ui.input(|i| user_interacted(&i.events)) {
-        sess.has_been_viewed.store(true, Ordering::Relaxed);
-    }
-    // 字体度量缓存：字号/DPI 不变时跳过 fonts_mut 锁查询。
+    // ── 交互**不改写页签状态**：打字/滚轮/点击只是回显，与真输出同路，✅/🔄
+    // 一律由终端输出本身判（app.rs tab_icon）。“已查看”（消 ✅）只在切页签与
+    // 窗口找回前台时记账（app.rs）。
+
     let font_id = FontId::monospace(TERM_FONT_SIZE);
     let ppp = ui.ctx().pixels_per_point();
     let (cell_w, cell_h) = match sess.cached_metrics {
@@ -1111,11 +1084,10 @@ if resized {
         // 其他 ScrollArea（页签栏/设置页），否则滚终端会连带滚别的滚动区。
         ui.input_mut(|i| i.smooth_scroll_delta.y = 0.0);
         let action = wheel_scroll_action(*wheel, cell_h, mouse_reporting, alt_screen);
-        // 滚轮即「用户驱动视口操作」：转发给 TUI 后 TUI 会重绘回显新输出 →
-        // reader 刷新 last_output_ms → 页签误亮 🔄。凡是把滚轮写进 PTY 的
-        // 分支都在这里统一记一次滚动回显短窗口（app.rs SCROLL_ECHO_MS=500ms，
-        // 不共用键盘输入 1.5s 窗口）：只吞滚动引起的这一下重绘，真实任务输出
-        // 晚于窗口即照常判 🔄。本地滚动分支不产生 PTY 输出，不写任何时间戳。
+        // 滚轮是「用户驱动视口操作」：把滚轮写进 PTY 的分支统一记一次时间戳，
+        // 只给帧率调度用（app.rs SCROLL_ECHO_MS=500ms，短于键盘输入 1.5s 窗口）
+        // ——转发后 TUI 整屏重绘，这几帧要跟手。**页签状态不读它**：滚动引起的
+        // 重绘由 session.rs 的视口偏移判据剔除（滚出来的变化不是内容）。
         // 记账点收敛在一处：早先只在 ForwardMouse 记，PageKey（PgUp/PgDn 翻页，
         // 即不开鼠标上报的全屏 TUI——pi 等）漏记 → 用户一滚轮页签就常亮 🔄。
         if stamps_scroll_echo(&action) {
@@ -1222,7 +1194,7 @@ scroll_now(&sess.term, &sess.cmd_tx, Scroll::Delta(n));
                 // 中键：照旧立即转发。
                 if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
                     let (col, row) = to_col_row(pos);
-                    // 同滚轮：点击是「用户驱动」写入，TUI 重绘回显不算任务在跑。
+                    // 同滚轮：点击是「用户驱动」写入，TUI 重绘回显只算帧率交互。
                     stamp_user_input(sess);
                     send_mouse_event(&sess.writer, sgr_mouse, 1, col, row, false);
                     ui.ctx().request_repaint();
@@ -1238,7 +1210,7 @@ scroll_now(&sess.term, &sess.cmd_tx, Scroll::Delta(n));
             && let Some(pos) = ui.input(|i| i.pointer.latest_pos())
         {
             let (col, row) = to_col_row(pos);
-            // 中键释放同样会引发 TUI 重绘 → 记输入窗口。
+            // 中键释放同样会引发 TUI 重绘 → 记帧率交互窗口。
             stamp_user_input(sess);
             send_mouse_event(&sess.writer, sgr_mouse, 0, col, row, true);
             ui.ctx().request_repaint();
@@ -1379,7 +1351,7 @@ if let Some(mut t) = try_wlock(&sess.term) {
                 } else if let Some((code, col, row, sgr)) = sess.mouse_press_pending.take() {
                     // 普通点击：按原行为成对转发（按下位置 + 释放位置）。
                     // 成对字节是一次用户驱动的写入（TUI 多半立刻重绘/滚屏），
-                    // 记键盘输入窗口，免得页签把它当成任务在跑。
+                    // 记帧率交互窗口（与页签状态无关）。
                     stamp_user_input(sess);
                     send_mouse_bytes(&sess.writer, mouse_event_bytes(sgr, code, col, row, false));
                     let (col2, row2) = to_col_row(latest_pos.unwrap_or(rect.center()));
@@ -2456,47 +2428,6 @@ let term = Arc::new(RwLock::new(Term::new(
             assert_eq!(a, adapt_fg_light(f));
             assert_eq!(b, adapt_bg_light(Color32::from_rgb(255, 255, 255)));
         }
-    }
-
-    /// 失焦/回焦与光标移动不是「已查看」：否则窗口恢复焦点的那一帧抹掉 ✅，
-    /// 用户看不到失焦期间当前页签跑完（回归钉住）。
-    #[test]
-    fn focus_and_pointer_motion_are_not_interaction() {
-        assert!(!user_interacted(&[]));
-        assert!(!user_interacted(&[egui::Event::WindowFocused(false)]));
-        assert!(!user_interacted(&[egui::Event::WindowFocused(true)]));
-        assert!(!user_interacted(&[egui::Event::ModifiersChanged(
-            egui::Modifiers::default()
-        )]));
-        assert!(!user_interacted(&[egui::Event::PointerMoved(egui::pos2(1.0, 2.0))]));
-        assert!(!user_interacted(&[egui::Event::MouseMoved(egui::vec2(3.0, 4.0))]));
-        assert!(!user_interacted(&[egui::Event::PointerGone]));
-        // 真交互仍然记账。
-        assert!(user_interacted(&[egui::Event::Text("a".into())]));
-        assert!(user_interacted(&[egui::Event::Key {
-            key: egui::Key::A,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::default(),
-        }]));
-        assert!(user_interacted(&[egui::Event::PointerButton {
-            pos: egui::pos2(1.0, 2.0),
-            button: egui::PointerButton::Primary,
-            pressed: true,
-            modifiers: egui::Modifiers::default(),
-        }]));
-        assert!(user_interacted(&[
-            egui::Event::WindowFocused(true),
-            egui::Event::PointerMoved(egui::pos2(1.0, 2.0)),
-            egui::Event::MouseMoved(egui::vec2(3.0, 4.0)),
-            egui::Event::MouseWheel {
-                unit: egui::MouseWheelUnit::Point,
-                delta: egui::vec2(0.0, 1.0),
-                modifiers: egui::Modifiers::default(),
-                phase: egui::TouchPhase::End,
-            },
-        ]));
     }
 
     fn key_bytes(k: egui::Key, ctrl: bool, alt: bool, shift: bool) -> Option<Vec<u8>> {

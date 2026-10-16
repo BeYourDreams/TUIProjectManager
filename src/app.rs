@@ -41,27 +41,19 @@ const BUSY_FRAME_MS: u64 = 100;
 /// ponytail: 想提到 60 FPS 只把本常量改回 16（= 显示刷新率上限），不涉渲染路径。
 const INTERACT_FRAME_MS: u64 = 33;
 
-/// 本帧窗口是**被鼠标点回前台**的（则当前页签的 ✅ 该抹掉）。
+/// 本帧窗口**回到前台**（则当前页签的 ✅ 该抹掉）。
 ///
-/// 焦点变化一律不算「已查看」（terminal.rs user_interacted）：Alt-Tab / 键盘切回
-/// 只是把窗口亮回来，人可能压根没在看屏幕，抹掉 ✅ 等于白亮。
-/// 但「用鼠标点一下把它拉回前台」是明确的人为动作，就该抹。区分方法：winit 一次
-/// 事件泵里把 `WindowFocused(true)` 和这次点击的指针事件排在同一帧（Windows 先发
-/// WM_ACTIVATE 再发鼠标消息），同帧出现才算。只认按下/滚轮，不认 PointerMoved
-/// （鼠标只是扫过窗口也会带焦点事件）。
-fn window_activated_by_mouse(ctx: &egui::Context) -> bool {
-    ctx.input(|i| activated_by_mouse_events(&i.events))
+/// 人把窗口拉回眼前（点一下/鼠标移入悬停激活/Alt-Tab/键盘切回）就是「人在看
+/// 当前页签」，✅ 该消——用户拍板：不区分用何种方式，只要窗口刚拿回焦点。
+fn window_activated(ctx: &egui::Context) -> bool {
+    ctx.input(|i| window_activated_events(&i.events))
 }
 
-/// [`window_activated_by_mouse`] 的纯函数芯（可单测）。
-fn activated_by_mouse_events(events: &[egui::Event]) -> bool {
-    events.iter().any(|e| matches!(e, egui::Event::WindowFocused(true)))
-        && events.iter().any(|e| {
-            matches!(
-                e,
-                egui::Event::PointerButton { .. } | egui::Event::MouseWheel { .. }
-            )
-        })
+/// [`window_activated`] 的纯函数芯（可单测）。
+fn window_activated_events(events: &[egui::Event]) -> bool {
+    events
+        .iter()
+        .any(|e| matches!(e, egui::Event::WindowFocused(true)))
 }
 
 /// 帧间隔决策：交互活跃（打字 **或** 滚动，不分档）> 输出在途 > 全静止。纯函数，便于自检。
@@ -99,18 +91,12 @@ const OUTPUT_END_MS: u64 = 3_000;
 /// 远好过谎报完成 + 误弹「任务完成」）。系统通知另有更严的 [`TOAST_QUIET_MS`]
 /// （10s），不受此值影响。
 const DONE_QUIET_MS: u64 = 8_000;
-/// 用户驱动回显例外（✂ 不吞任务真实输出）：键盘/IME/粘贴、点击/中键转发都写
-/// last_input_ms（terminal.rs 统一走 stamp_user_input 记账）→ 直接引发的回显
-/// 是用户驱动、不是任务在跑，其窗口内跳过 🔄 判定；滚动转发的 TUI 重绘回显记
-/// last_scroll_ms 走自己的 500ms 短窗（见 SCROLL_ECHO_MS）。真实输出晚于各自
-/// 窗口仍按 last_out 正常判 🔄——输入/滚动看日志期间页签照常实时刷新运行状态。
+/// 交互帧率窗口：键盘/IME/粘贴/点击转发写 `last_input_ms`、滚轮转发写
+/// `last_scroll_ms`（terminal.rs 统一记账），**只用来把整窗帧率拉到交互档**
+/// （见 [`frame_delay_ms`]）。页签状态判定不读这两个时间戳：回显与真输出同路。
 const INPUT_ACTIVE_MS: u64 = 1_500;
-/// 滚动转发回显例外窗口：鼠标上报/备用屏路径滚轮转发 TUI 后，TUI 立即整屏
-/// 重绘回显 → 刷新 last_output_ms → 若不加例外会误亮 🔄 3s。记 last_scroll_ms
-/// 专用短窗（terminal.rs 滚动处理处 stamps_scroll_echo 统一写，两个转发分支
-/// 都不漏），只吞滚动驱动的这一下重绘；真实任务输出晚于窗口即照常判 🔄——
-/// 持续滚动看日志时页签仍实时显示运行中。
-/// 本地缓冲滚动（普通 shell）不产生 PTY 输出，不写此字段，完全不影响图标。
+/// 滚轮帧率窗口（比键盘短）：滚轮转发后 TUI 整屏重绘，回显只追这几帧的跟手。
+/// 本地缓冲滚动（普通 shell）不产生 PTY 输出，不写此字段。
 const SCROLL_ECHO_MS: u64 = 500;
 /// 「执行完成」通知/闪烁需在 ✅ 稳定停留 2s（过滤 🔄↔✅ 间隙横跳）。
 const DONE_STABLE_MS: u64 = 2_000;
@@ -2078,6 +2064,9 @@ struct ToolState {
     install_dir: PathBuf,
     /// 本轮在装的 tag：作业非成功结束时用它把下载按钮重新点亮（可再点重试）。
     pending_tag: Option<String>,
+    /// 下载进度文本（`42.1% (1.2 MB/2.8 MB)`）：画在设置页这个工具的按钮后面，
+    /// **不占状态栏**（进度每秒刷十几次，挤在底部一行里既看不清也扰民）。
+    progress: Option<String>,
     /// 我们亲手装上的那个 tag（Done 时记下）。当本地版本读不出来时
     /// （`--version` 输出认不出）拿它兜底，否则同一个 tag 会被反复当成
     /// 「有新版本」，按钮刚点完又冒出来。
@@ -2093,6 +2082,7 @@ impl ToolState {
             missing: false,
             install_dir: PathBuf::new(),
             pending_tag: None,
+            progress: None,
             installed_tag: None,
         }
     }
@@ -3251,6 +3241,9 @@ pub struct ClientApp {
     update_rx: Receiver<(String, Option<String>)>,
     /// 下载进度：后台线程通过通道报告 (bytes_downloaded, total_bytes)。
     download_progress_rx: Option<Receiver<(u64, u64)>>,
+    /// 自更新下载进度文本：画在设置页顶部更新横幅的「⬇ 下载中…」后面，
+    /// 不占状态栏（同 ToolState::progress）。
+    dl_progress: Option<String>,
     /// 当前正在下载更新（显示进度条，禁用下载按钮）。
     downloading: bool,
     /// 取消下载信号：用户点击取消时置 true，下载线程检测后退出。
@@ -3399,11 +3392,14 @@ fn watched(is_current: bool, app_fg: bool) -> bool {
 ///   或画面在 ≤MOTION_HOLD_MS 内**连续**动过（跨得过一个采样间隔）
 ///   或 最近 3s 内有成规模内容变化
 ///   或 内容才停了不到 DONE_QUIET_MS（不确定窗口，宁可先报在跑）→ 运行中。
-///   · 最近 1.5s 打字、500ms 滚轮回显不算「在跑」（用户自己弄出来的）。
 /// ✅ 有内容、**未查看**、成规模内容已 ≥DONE_QUIET_MS 未变、画面也不在高频动
 ///   → 完成/待查看。
 /// 其余（已查看 / 从无内容）→ 空。激活页签跑完同样先亮 ✅（不看是不是当前页签），
-/// 但真实交互（点/切页签、终端内操作，记账在 `has_been_viewed`）一到就熄。
+/// 切到别的页签（记账在 `has_been_viewed`）就熄。
+///
+/// 判据**只看终端输出**：用户打字/滚轮引发的回显与真输出同一条路，没有
+/// 「用户驱动例外」。旧例外两头出错：打字回显只改 1~2 格（不刷内容时间戳）→
+/// 直接掉进 ✅；滚动转发整屏重绘 → 例外把 🔄 吞掉后剩余条件不成立 → 图标空掉。
 #[allow(clippy::too_many_arguments)]
 fn tab_icon(
     exited: bool,
@@ -3414,8 +3410,6 @@ fn tab_icon(
     last_screen: u64,
     last_motion: u64,
     now_ms: u64,
-    last_input: u64,
-    last_scroll: u64,
 ) -> Option<&'static str> {
     if exited {
         return Some("❌");
@@ -3423,11 +3417,7 @@ fn tab_icon(
     if loading {
         return Some("🔄");
     }
-    // 用户驱动例外：最近 1.5s 内键盘输入、或 500ms 内转发滚轮——输入回显本身
-    // 会改屏幕，但那是用户自己弄的，不代表任务在跑。
-    let typing = last_input != 0 && now_ms.saturating_sub(last_input) < INPUT_ACTIVE_MS;
-    let scroll_echo = last_scroll != 0 && now_ms.saturating_sub(last_scroll) < SCROLL_ECHO_MS;
-    // 画面在高频动 ⇒ 界面在动（spinner/时钟/进度条/流式打字）→ 不是结束态。
+    // 画面在高频动
     // 一次采样定生死：spinner 每 ~100ms 一帧，1s 门限下采样恒落在窗口内。
     let screen_busy = last_screen != 0 && now_ms.saturating_sub(last_screen) < ANIM_BUSY_MS;
     // 画面在**连续**快速动（进度条/流式打字这类间隔 >ANIM_BUSY_MS 但
@@ -3446,9 +3436,7 @@ fn tab_icon(
     // 长命令的无声期）——这时判完成太早（用户反馈「实际还在执行，状态却说完成」），
     // 判空图标又像丢了状态，所以继续报在跑。1Hz 秒表/时钟的 last_content 早就是
     // 陈旧的（它不算内容），照样落回 ✅。
-    // 用户驱动的输入/滚轮回显窗口内不报 🔄（回显是用户自己弄出来的）。
-    let user_own_echo = typing || scroll_echo;
-    if !user_own_echo && (fresh_content || screen_busy || motion || !quiet_enough) {
+    if fresh_content || screen_busy || motion || !quiet_enough {
         return Some("🔄");
     }
     // 完成：静默已过门槛、有内容、**未查看**。其余（已查看 / 从无内容）→ 空。
@@ -3555,14 +3543,12 @@ fn refresh_tab_state(s: &crate::session::Session, now_ms: u64) {
         s.last_screen_change_ms.load(Ordering::Relaxed),
         s.last_motion_ms.load(Ordering::Relaxed),
         now_ms,
-        s.last_input_ms.load(Ordering::Relaxed),
-        s.last_scroll_ms.load(Ordering::Relaxed),
     ));
     let flags = ((exited as u8) * SNAP_EXITED) | ((loading as u8) * SNAP_LOADING);
     s.state_icon.store(code | flags, Ordering::Relaxed);
 // 完成态与图标同源同刻、同一份判据：只有「会亮 ✅」的快照才允许进入
-    // 「任务完成」通知分支——退出/加载中不算、画面高频动不算、用户驱动的
-    // 输入/滚轮回显窗口不算、成规模内容静默 ≥3s 且未查看才算。通知那侧另有
+    // 「任务完成」通知分支——退出/加载中不算、画面高频动不算、成规模内容
+    // 静默 ≥8s 且未查看才算。通知那侧另有
     // out_bytes / viewed / 10s 静默等门槛（见 update_done_states）。
     s.state_done.store(code == ICON_DONE, Ordering::Relaxed);
 }
@@ -3920,6 +3906,7 @@ impl ClientApp {
             term_focused: false,
             update_latest: None,
             download_progress_rx: None,
+            dl_progress: None,
             downloading: false,
             cancel_download: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             update_done: false,
@@ -4253,6 +4240,7 @@ fn strip_geom_for_frame(
         let tag = self.tools[idx].latest.clone();
         self.tools[idx].downloading = true;
         self.tools[idx].latest = None;
+        self.tools[idx].progress = None;
         // 记住本轮在装的 tag：作业结束（失败/取消/被占用）时用它把下载按钮
         // 重新点亮，用户可直接再点一次重试，而不必等下次「检查更新」。
         // 首次安装没有 tag（None）——按钮靠 missing 标记继续显示。
@@ -4315,6 +4303,7 @@ fn strip_geom_for_frame(
         }
         self.downloading = true;
         self.update_done = false; // 新一轮下载，重启按钮回到待完成态。
+        self.dl_progress = None;
         self.status = Some(format!("正在下载 {tag}…"));
         // 重置取消信号
         self.cancel_download.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -5231,12 +5220,9 @@ pad: tab_margin.left as f32 + tab_margin.right as f32,
                     let now_ms = crate::now_ms();
 // ── 状态判定：仅凭屏幕可见格的变化 ──
                     // reader 逐块比对可见格快照（见 session.rs MIN_CONTENT_CELLS）：
-                    // 成规模变化 ≤3s → 🔄，停了 ≥3s → ✅/空；整屏重画同样的字、
-                    // 秒表时钟的小刷新都不算内容。滚动/翻页只改视口不产生 PTY
-                    // 输出 → 不计更新状态。用户驱动例外：最近 1.5s 内
-                    // 向终端输过键（last_input_ms，仅键盘/IME/粘贴路径更新）或
-                    // 500ms 内转发过滚轮（last_scroll_ms）→ 直接引发的回显不
-                    // 算任务在跑 → 跳过 🔄；真实输出晚于窗口照常判 🔄。
+                    // 成规模变化 ≤3s → 🔄，停了 ≥8s → ✅/空；整屏重画同样的字、
+                    // 秒表时钟的小刷新、滚轮/输入回显都不算内容（滚动只改视口）。
+                    // 判定只看终端输出，没有「用户驱动例外」。
                     // 状态快照：最快 1s 重算一次（STATE_CHECK_MS），退出/加载/
                     // 新实质内容这三类事件不等门限（见 state_due）。
 refresh_tab_state(s, now_ms);
@@ -5617,6 +5603,21 @@ let s = TAB_GAP;
             format!("{:.1} KB", bytes as f64 / 1024.0)
         } else {
             format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
+        }
+    }
+
+    /// 下载进度文本（总数未知时只报已下载字节）。自更新与工具安装共用一份格式，
+    /// 两处进度不会各写各的。
+    fn progress_text(downloaded: u64, total: u64) -> String {
+        if total > 0 {
+            format!(
+                "{:.1}% ({}/{})",
+                downloaded as f64 / total as f64 * 100.0,
+                Self::format_bytes(downloaded),
+                Self::format_bytes(total)
+            )
+        } else {
+            Self::format_bytes(downloaded)
         }
     }
 
@@ -6833,11 +6834,23 @@ ui.label(
     /// 不那么挤的地方点，否则长标签会挤掉右簇的深浅色按钮。状态栏消息里那条
     /// “发现新版本 …” 点一下就能跳到这块。
     fn self_update_buttons_ui(&mut self, ui: &mut egui::Ui) {
-        if let Some(tag) = self.update_latest.clone() {
+        // 下载中即使 update_latest 被重试消息清空（那条通道不携 tag）也要留着这一
+        // 行：进度与「✕ 取消」都在这儿，没了就按不到停止。
+        let tag = self
+            .update_latest
+            .clone()
+            .or_else(|| self.downloading.then(String::new));
+        if let Some(tag) = tag {
             if self.downloading {
-                // 下载中：进度文字 + 取消（具体百分比在状态栏消息里随下载线程刷新）。
+                // 下载中：进度文字 + 取消。百分比就地刷在这一行（原先刷状态栏：
+                // 每秒十余次把底部整行刷屏）。
+                let pct = self
+                    .dl_progress
+                    .as_deref()
+                    .map(|p| format!("  {p}"))
+                    .unwrap_or_default();
                 ui.label(
-                    RichText::new(format!("⬇ 下载中… {tag}"))
+                    RichText::new(format!("⬇ 下载中… {tag}{pct}"))
                         .color(ui.visuals().widgets.inactive.text_color()),
                 );
                 if ui.button("✕ 取消").on_hover_text("取消当前下载").clicked() {
@@ -6868,7 +6881,7 @@ ui.label(
     /// （原代码整段搬过来，只把 `continue` 换成 `return`）：已装且有新版 → 「⬇ pi vX」；
     /// 没装 → 「⬇ 安装 pi」（tag 未知则点下去现查）；装在别处、本软件目录里没有 →
     /// 「⬇ 装 pi 到本软件目录」；拿不到可写目录 → 不画按钮。下载中 → 进度文字 +
-    /// 「✕ 取消」。
+    /// 「✕ 取消」（百分比就画在这一行，不占状态栏）。
     ///
     /// 为什么搬过来：装/升级是低频操作，却挤在状态栏最窄的一行里，字小、要点得准，
     /// 挤不下时还得横向滚才看全；而“有什么可更新”一次看完才是顺手的路径。搬走后
@@ -6893,8 +6906,14 @@ ui.label(
             .as_ref()
             .is_some_and(|d| d.join(spec.exe_name).is_file());
         if downloading {
+            // 进度就地跟在按钮位后面（不再刷状态栏）。
+            let pct = self.tools[idx]
+                .progress
+                .as_deref()
+                .map(|p| format!("  {p}"))
+                .unwrap_or_default();
             ui.label(
-                RichText::new(format!("⬇ {} 下载中…", spec.label))
+                RichText::new(format!("⬇ {} 下载中…{pct}", spec.label))
                     .color(ui.visuals().widgets.inactive.text_color()),
             );
             if ui
@@ -8213,20 +8232,18 @@ impl eframe::App for ClientApp {
             }
         }
 
-// 鼠标把窗口激活回来 = 「人正看着当前页签」→ 抹掉当前页签 ✅（纯函数，见
-        // window_activated_by_mouse 的注释）。与 terminal.rs user_interacted 挡掉的
-        // 「失焦/回焦不算看过」互补：Alt-Tab / 键盘切回依旧不清，鼠标点回才清。
-        if window_activated_by_mouse(ctx)
+        // 窗口回到前台 = 「人在看当前页签」→ 抹 ✅（与如何拉回无关：点击/悬停
+        // 激活/Alt-Tab/键盘切回一视同仁；纯函数见 window_activated_events）。
+        if window_activated(ctx)
             && let Some(Tab::Session(s)) = self.tabs.get(self.current)
         {
             s.has_been_viewed.store(true, Ordering::Relaxed);
         }
 
-// 「已查看」同时管 ✅ 图标与**系统通知**：真实交互一到就把 ✅ 清成空
-        // （tab_icon_from_snap 每帧直读，立刻生效）。它只由**真实交互**置位：点/切页签
-        // （TabAction::Activate、Ctrl+Tab）、在终端里点击/选中/滚轮/打字（terminal.rs
-        // show_terminal 入口统一记账，窗口焦点变化与光标移动不算交互）。没交互过就
-        // 一直算「未查看」→ 激活页签跑完照样亮 ✅，操作一下才消；新一轮输出会复位
+        // 「已查看」同时管 ✅ 图标与**系统通知**：切到别的页签、或鼠标把窗口点回
+        // 前台就把 ✅ 清成空（tab_icon_from_snap 每帧直读，立刻生效）。记账点只有
+        // 这两处：终端内的打字/滚轮/点击**不算**——回显与真输出同路，状态只该看输出。
+        // 没交互过就一直算「未查看」→ 激活页签跑完照样亮 ✅；新一轮输出会复位
         // viewed（session.rs 读循环），下一轮跑完再亮。
         for (i, t) in self.tabs.iter().enumerate() {
             if let Tab::Session(s) = t {
@@ -8310,8 +8327,9 @@ let delay_ms = frame_delay_ms(interacting, busy);
         ctx.request_repaint_after(std::time::Duration::from_millis(delay_ms));
         self.bg_frame = self.bg_frame.wrapping_add(1);
 
-        // 更新检查结果回到状态栏。
+        // 更新检查结果回到状态栏（下载进度不走这里：那只在设置页按钮后面刷）。
         if let Ok((msg, latest)) = self.update_rx.try_recv() {
+            self.dl_progress = None; // 任何一条终态/中间态消息都让上一条进度过期
             // 完成消息只在下载线程成功替换 exe 后发出：置标记，状态栏改显
             // 「重启应用」按钮。失败消息（“下载失败…重试”）不含该前缀。
             if msg.contains("下载完成") {
@@ -8328,19 +8346,11 @@ let delay_ms = frame_delay_ms(interacting, busy);
             self.update_latest = latest;
             ctx.request_repaint();
         }
-        // 下载进度实时更新状态栏。
+        // 下载进度只存文本，画在设置页更新区（状态栏不再被每秒十余次的百分比刷屏）。
         if let Some(rx) = &self.download_progress_rx
             && let Ok((downloaded, total)) = rx.try_recv()
         {
-            if total > 0 {
-                let pct = downloaded as f64 / total as f64 * 100.0;
-                self.status = Some(format!("下载中… {pct:.2}% ({}/{})",
-                    Self::format_bytes(downloaded),
-                    Self::format_bytes(total)));
-            } else {
-                self.status = Some(format!("下载中… {}",
-                    Self::format_bytes(downloaded)));
-            }
+            self.dl_progress = Some(Self::progress_text(downloaded, total));
             ctx.request_repaint();
         }
         // 下载线程结束后清理通道：仅当发送端已全部掉落（线程退出）才清理，
@@ -8353,6 +8363,7 @@ let delay_ms = frame_delay_ms(interacting, busy);
         {
             self.downloading = false;
             self.download_progress_rx = None;
+            self.dl_progress = None;
             ctx.request_repaint();
         }
         // pi / opencode 的检查/下载事件：排空通道逐条消费（一次 try_recv
@@ -8411,21 +8422,12 @@ let delay_ms = frame_delay_ms(interacting, busy);
                     }
                 }
                 ToolEvent::Status(msg) => {
+                    // 进程重启到新链/重试等待期：上一条字节进度已失效，收掉。
+                    self.tools[idx].progress = None;
                     self.status = Some(msg);
                 }
                 ToolEvent::Progress(downloaded, total) => {
-                    let label = TOOL_SPECS[idx].label;
-                    self.status = Some(if total > 0 {
-                        format!(
-                            "下载 {} 中… {:.2}% ({}/{})",
-                            label,
-                            downloaded as f64 / total as f64 * 100.0,
-                            Self::format_bytes(downloaded),
-                            Self::format_bytes(total)
-                        )
-                    } else {
-                        format!("下载 {} 中… {}", label, Self::format_bytes(downloaded))
-                    });
+                    self.tools[idx].progress = Some(Self::progress_text(downloaded, total));
                 }
                 ToolEvent::Done { msg, version } => {
                     // 首次安装（was_missing）顺手把新 exe 写进「启动命令」列表：
@@ -8436,6 +8438,7 @@ let delay_ms = frame_delay_ms(interacting, busy);
                     self.tools[idx].installed_tag = Some(version);
                     self.tools[idx].latest = None;
                     self.tools[idx].pending_tag = None;
+                    self.tools[idx].progress = None;
                     // 装完 exe 已在安装目录里，不再是「未安装」：状态栏那个
                     // 「⬇ 安装」按钮自行退场。
                     self.tools[idx].missing = false;
@@ -8458,6 +8461,7 @@ let delay_ms = frame_delay_ms(interacting, busy);
                 }
                 ToolEvent::Finished => {
                     self.tools[idx].downloading = false;
+                    self.tools[idx].progress = None;
                     // 非成功结束（取消/被占用/重试到顶）：把下载按钮重新点亮，
                     // 用户可直接再点一次重试。Done 已在上面清了 pending_tag，
                     // 所以不会在这里把刚装好的版本又标成“有新版本”。未安装
@@ -8826,8 +8830,6 @@ tab_icon(
             now.saturating_sub(silent_ms),
             0,
             now,
-            0,
-            0,
         )
     }
 
@@ -8891,43 +8893,45 @@ tab_icon(
     #[test]
     fn never_output_never_flashes_running() {
         let now = 100_000u64;
-        assert_eq!(tab_icon(false, false, 0, false, 0, 0, 0, now, 0, 0), None);
+        assert_eq!(tab_icon(false, false, 0, false, 0, 0, 0, now), None);
     }
 
     // 已退出 / 启动加载具有最高优先级。
     #[test]
     fn exited_and_loading_override() {
         let now = 100_000u64;
-        assert_eq!(tab_icon(true, false, 10, false, 0, 0, 0, now, 0, 0), Some("❌"));
-        assert_eq!(tab_icon(false, true, 10, false, 0, 0, 0, now, 0, 0), Some("🔄"));
+        assert_eq!(tab_icon(true, false, 10, false, 0, 0, 0, now), Some("❌"));
+        assert_eq!(tab_icon(false, true, 10, false, 0, 0, 0, now), Some("🔄"));
     }
 
-    // 输入驱动例外：最近 1.5s 内用户输过键，输入回显不判运行中；窗口过期后
-    // 按内容判 🔄。
+    // 打字回显（只改 1~2 格，不刷内容时间戳）不得误触发 ✅：旧实现在输入窗口
+    // 里跳过 🔄 判定，静默够久就掉进 ✅ 分支；现在判据只看输出。
     #[test]
-    fn typing_echo_not_running() {
+    fn typing_echo_never_shows_done() {
         let now = 100_000u64;
-        let f = |last_input| {
-            tab_icon(false, false, 10, false, now - 1_000, now - 1_000, 0, now, last_input, 0)
-        };
-        assert_eq!(f(now - 1_000), None);
-        assert_eq!(f(now - 1_501), Some("🔄")); // 窗口过期
-        assert_eq!(f(0), Some("🔄")); // 从未输入
+        // 内容早停 10s、未查看：若屏幕刚因回显变过（1 格）→ 仍在动。
+        assert_eq!(
+            tab_icon(false, false, 10, false, now - 10_000, now - 100, 0, now),
+            Some("🔄")
+        );
+        // 回显也停了 → 输出确实结束，✅ 照旧。
+        assert_eq!(
+            tab_icon(false, false, 10, false, now - 10_000, now - 10_000, 0, now),
+            Some("✅")
+        );
     }
 
-    // 输入窗口不吞 🔄 分类：任务完成后敲新命令（输入窗口内、内容已停 ≥3s）
-    // 仍判完成而非运行中；但打字同时置位 viewed → 已查看，✅ 应清成空。
+    // 已查看只看 viewed 位（切页签/鼠标点回窗口记账）：✅ 清成空与输入无关。
     #[test]
     fn typing_keeps_done_visible() {
         let now = 100_000u64;
         assert_eq!(
-            tab_icon(false, false, 10, false, now - 10_000, now - 10_000, 0, now, now - 500, 0),
+            tab_icon(false, false, 10, false, now - 10_000, now - 10_000, 0, now),
             Some("✅")
         );
         assert_eq!(
-            tab_icon(false, false, 10, true, now - 10_000, now - 10_000, 0, now, now - 500, 0),
-            None,
-            "真实交互（打字）置位 viewed → ✅ 清空"
+            tab_icon(false, false, 10, true, now - 10_000, now - 10_000, 0, now),
+            None
         );
     }
 
@@ -8939,19 +8943,19 @@ tab_icon(
         // 内容早已静默 10s，但画面 100ms 前还在变（spinner 在动）→ 🔄。
         for ago in [0u64, 40, 99, 150] {
             assert_eq!(
-                tab_icon(false, false, 10, false, now - 10_000, now - ago, 0, now, 0, 0),
+                tab_icon(false, false, 10, false, now - 10_000, now - ago, 0, now),
                 Some("🔄"),
                 "画面还在高频动 = 还在思考/跑命令（ago={ago}）"
             );
         }
         // 变化停 300ms（> ANIM_BUSY_MS）→ 照常亮 ✅（回合真跑完了）。
         assert_eq!(
-            tab_icon(false, false, 10, false, now - 10_000, now - 300, 0, now, 0, 0),
+            tab_icon(false, false, 10, false, now - 10_000, now - 300, 0, now),
             Some("✅")
         );
 // 边界：恰好 250ms（= ANIM_BUSY_MS）算「不忙」（用 < 而非 <=）。
         assert_eq!(
-            tab_icon(false, false, 10, false, now - 10_000, now - ANIM_BUSY_MS, 0, now, 0, 0),
+            tab_icon(false, false, 10, false, now - 10_000, now - ANIM_BUSY_MS, 0, now),
             Some("✅")
         );
     }
@@ -8964,7 +8968,7 @@ tab_icon(
         let now = 100_000u64;
         // 每秒一跳：上一次跳在 1s 前（>250ms，不算「在动」），内容已停 10s → ✅。
         assert_eq!(
-            tab_icon(false, false, 10, false, now - 10_000, now - 1_000, 0, now, 0, 0),
+            tab_icon(false, false, 10, false, now - 10_000, now - 1_000, 0, now),
             Some("✅"),
             "1Hz 秒表/时钟只改几个格，不该永远钉在 🔄"
         );
@@ -8976,7 +8980,7 @@ tab_icon(
     fn identical_repaint_is_not_progress() {
         let now = 100_000u64;
         assert_eq!(
-            tab_icon(false, false, 10, false, now - 10_000, now - 10_000, 0, now, 0, 0),
+            tab_icon(false, false, 10, false, now - 10_000, now - 10_000, 0, now),
             Some("✅")
         );
     }
@@ -8986,15 +8990,15 @@ tab_icon(
     fn screen_animation_does_not_override_running() {
         let now = 100_000u64;
         assert_eq!(
-            tab_icon(false, false, 10, false, now - 500, now - 100, 0, now, 0, 0),
+            tab_icon(false, false, 10, false, now - 500, now - 100, 0, now),
             Some("🔄")
         );
         assert_eq!(
-            tab_icon(false, true, 10, false, now - 10_000, now - 100, 0, now, 0, 0),
+            tab_icon(false, true, 10, false, now - 10_000, now - 100, 0, now),
             Some("🔄")
         );
         assert_eq!(
-            tab_icon(true, false, 10, false, now - 10_000, now - 100, 0, now, 0, 0),
+            tab_icon(true, false, 10, false, now - 10_000, now - 100, 0, now),
             Some("❌")
         );
     }
@@ -9022,20 +9026,19 @@ fn scrolling_does_not_count_as_update() {
         assert_eq!(icon(10, false, 10_000), Some("✅"));
     }
 
-    // 滚动转发回显例外（500ms 短窗）：TUI 被滚轮触发整屏重绘 → 不亮 🔄；
-    // 窗口过期后真实输出照常判 🔄。本地缓冲滚动不写 last_scroll（=0）→ 无例外。
+    // 滚轮转发引发的整屏重绘与真输出同路：要么在动、要么真完了，
+    // 不再有「用户驱动例外」把状态改写成空。
     #[test]
-    fn scroll_echo_window_only_swallows_prompt_redraw() {
+    fn scroll_echo_is_not_a_state_of_its_own() {
         let now = 100_000u64;
-        let f = |last_scroll, last_screen| {
-            tab_icon(false, false, 10, false, now - 100, last_screen, 0, now, 0, last_scroll)
-        };
-        assert_eq!(f(now - 100, now - 100), None); // 例外生效
-        assert_eq!(f(now - 501, now - 100), Some("🔄")); // 窗口过期
-        assert_eq!(f(0, now - 100), Some("🔄")); // 无滚动记录
-        // 例外不吞 ✅：内容早停、未查看 → 仍判完成。
+        // 重绘刚回来（整屏变化 = 成规模内容）→ 🔄，不是空。
         assert_eq!(
-            tab_icon(false, false, 10, false, now - 10_000, now - 10_000, 0, now, 0, now - 100),
+            tab_icon(false, false, 10, false, now - 100, now - 100, 0, now),
+            Some("🔄")
+        );
+        // 画面可以不动、没有新鲜内容：✅ 照旧。
+        assert_eq!(
+            tab_icon(false, false, 10, false, now - 10_000, now - 10_000, 0, now),
             Some("✅")
         );
     }
@@ -9125,8 +9128,6 @@ fn scrolling_does_not_count_as_update() {
                     screen.load(Ordering::Relaxed),
                     last_motion.load(Ordering::Relaxed),
                     now,
-                    0,
-                    0,
                 ));
             }
             // 前 1.5s 是「动画刚起步」的过渡期：确认「连续在动」需要两次变化
@@ -9194,40 +9195,29 @@ use super::{frame_delay_ms, BUSY_FRAME_MS, IDLE_HEARTBEAT_MS, INTERACT_FRAME_MS}
         assert_eq!(INTERACT_FRAME_MS, 33, "帧率上限 = 30 FPS");
     }
 
-    /// 鼠标点回前台 → 抹当前页签 ✅；Alt-Tab 切回（只有焦点事件）→ 保留。
+    /// 窗口回到前台（任何方式）→ 抹当前页签 ✅；没拿回焦点的事件不算。
     #[test]
-    fn mouse_activated_window_clears_done_only_with_pointer() {
-        use super::activated_by_mouse_events;
-        let click = egui::Event::PointerButton {
-            pos: egui::pos2(10.0, 10.0),
-            button: egui::PointerButton::Primary,
-            pressed: true,
-            modifiers: egui::Modifiers::default(),
-        };
-        let wheel = egui::Event::MouseWheel {
-            unit: egui::MouseWheelUnit::Point,
-            delta: egui::vec2(0.0, 1.0),
-            phase: egui::TouchPhase::Move,
-            modifiers: egui::Modifiers::default(),
-        };
-        let move_only = egui::Event::PointerMoved(egui::pos2(1.0, 1.0));
-        assert!(activated_by_mouse_events(&[
+    fn window_activation_clears_done() {
+        use super::window_activated_events;
+        assert!(window_activated_events(&[egui::Event::WindowFocused(true)]));
+        // 指针事件本来就不看（又不代表人在看屏幕）——有焦点事件就够了。
+        assert!(window_activated_events(&[
             egui::Event::WindowFocused(true),
-            click.clone()
+            egui::Event::PointerMoved(egui::pos2(1.0, 1.0)),
+            egui::Event::PointerButton {
+                pos: egui::pos2(10.0, 10.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
         ]));
-        assert!(activated_by_mouse_events(&[
-            egui::Event::WindowFocused(true),
-            wheel
-        ]));
-        // 只有焦点事件（Alt-Tab / 键盘切回）→ 不抹 ✅。
-        assert!(!activated_by_mouse_events(&[egui::Event::WindowFocused(true)]));
-        // 鼠标只是扫过窗口 → 不抹。
-        assert!(!activated_by_mouse_events(&[
-            egui::Event::WindowFocused(true),
-            move_only
-        ]));
-        // 失焦帧的点击不算（没拿到焦点）。
-        assert!(!activated_by_mouse_events(&[click]));
+        // 窗口本来就在前台（鼠标扫过/点一下，无焦点事件）→ 不抹。
+        assert!(!window_activated_events(&[egui::Event::PointerMoved(
+            egui::pos2(1.0, 1.0)
+        )]));
+        // 失焦帧（点到别的程序）→ 不抹。
+        assert!(!window_activated_events(&[egui::Event::WindowFocused(false)]));
+        assert!(!window_activated_events(&[]));
     }
 }
 

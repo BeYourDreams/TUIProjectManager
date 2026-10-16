@@ -223,9 +223,8 @@ pub struct Session {
     /// 通知，不影响 ✅ 图标——激活页签跑完也照亮）。
     /// 启动即 true（spawn 产物不需要提醒）；读取线程在「加载期之后」的每轮
     /// 新内容输出时复位 false → 完成通知只属于用户没看过的真输出轮；
-    /// 点击/切换到该页签（TabAction::Activate、Ctrl+Tab）、在终端里做任何
-    /// 交互（点击/拖选/滚轮/打字，terminal.rs show_terminal 入口统一记账）
-    /// 置回 true。
+    /// 点击/切换到该页签（TabAction::Activate、Ctrl+Tab）、或窗口找回前台
+    /// （app.rs window_activated：点击/悬停激活/Alt-Tab/键盘切回一视同仁）置回 true。
     ///
     /// 语义是「**有没有交互过**」，不是「是不是当前页签」：当前页签跑完同样
     /// 亮 ✅（用户要求），一碰就消。系统通知另有 watched() 管「正盯着不打扰」。
@@ -276,13 +275,12 @@ pub struct Session {
     pub state_icon: Arc<AtomicU8>,
     /// 状态快照（app.rs 写）：是否处于「完成态」（通知判据用，与图标同源同刻）。
     pub state_done: Arc<AtomicBool>,
-    /// 回显延迟探针：最近一次向 PTY 写入输入字节的毫秒时间戳。
-    /// 读取线程据此计算「按键 → 首块回显」延迟（TUIPM_LATENCY_DEBUG=1 打印）。
+    /// 最近一次向 PTY 写入输入字节的毫秒时间戳。仅供帧率调度判「交互活跃」
+    /// （app.rs INPUT_ACTIVE_MS）与回显延迟探针（TUIPM_LATENCY_DEBUG=1）：
+    /// **不参与**页签状态判定。
     pub last_input_ms: Arc<AtomicU64>,
     /// 最近一次**转发**滚轮给子进程的毫秒时间戳（鼠标上报/备用屏路径才写）。
-    /// TUI 收到滚轮后立即整屏重绘回显 → reader 刷新 last_output_ms → 页签
-    /// 误亮 🔄。记入专用短窗口（app.rs SCROLL_ECHO_MS，仅 500ms）：只吞滚动
-    /// 驱动的这一下重绘回显；真实任务输出晚于窗口即照常判 🔄。
+    /// 同上：只给帧率调度用（app.rs SCROLL_ECHO_MS），不参与页签状态判定。
     /// 本地缓冲滚动（普通 shell）不产生 PTY 输出，不写此字段。
     pub last_scroll_ms: Arc<AtomicU64>,
     /// 主键按下时的位置（仅 UI 线程用）：快速拖选兜底判定用。
@@ -783,6 +781,7 @@ const SCREEN_EVENT_MERGE_MS: u64 = 250;
 /// - `diff == 0`：整屏重画同样的字 → 一个时间戳都不刷。这正是「明明静止却
 ///   常亮 🔄、✅ 永远不亮」的成因。
 /// - `diff >= MIN_CONTENT_CELLS`：成规模内容 → 刷 `last_content_ms`（3s 窗口），
+///   调用方（读循环）在视口偏移变化（滚轮）时直接跳过本函数：滚出来的变化不是内容。
 ///   并把 `output_count` 顶到 ≥1：✅/🔄 的「有内容」门槛不该由**动画分类器**
 ///   （转义占比 >0.5）决定——带 SGR 高亮的输出（每 token 一个颜色）整轮都会被
 ///   判成动画而不计数，页签跑完只剩空图标、亮不出 ✅。
@@ -1097,6 +1096,10 @@ let mut last_chunk_ms: u64 = 0;
             // 上一次「画面变化事件」的时刻（stamp_screen_activity 用）：判
             // 「画面是否在连续快速动」，同一次重绘的相邻块按合并窗折叠。
             let mut last_event_ms: u64 = 0;
+            // 上一次的快照视口偏移（scrollback 行数）：滚轮只改视口，滚出来的
+            // 可见格变化不是新内容，不得刷新内容/画面时间戳（否则滚一下页签就
+            // 🔄 3s、✅ 被推后 8s——用户反馈「滚轮改写页签状态」）。
+            let mut prev_offset: usize = 0;
             // 跨块拼接缓冲：OMP 等程序的终端查询序列可能被 read() 切分到相邻块，
             // reply_to_queries 逐块扫描会漏掉。保留尾部未完成的转义序列，
             // 下一块拼接后重扫。
@@ -1437,15 +1440,22 @@ crate::log_crash("reader-panic", &format!("VT 解析 panic（后台页签），�
                                             now_chars.len()
                                         };
                                         std::mem::swap(&mut prev_screen, &mut now_chars);
-                                        stamp_screen_activity(
-                                            diff,
-                                            now_ms,
-                                            &mut last_event_ms,
-                                            &reader_last_screen_change,
-                                            &reader_last_content,
-                                            &reader_motion,
-                                            &output_count,
-                                        );
+                                        // 视口偏移变了 = 这一屏变化是滚出来的，不是
+                                        // 新内容：不刷任何时间戳（图标/通知不跟着滚轮动）。
+                                        let offset = t.grid().display_offset();
+                                        let scrolled = offset != prev_offset;
+                                        prev_offset = offset;
+                                        if !scrolled {
+                                            stamp_screen_activity(
+                                                diff,
+                                                now_ms,
+                                                &mut last_event_ms,
+                                                &reader_last_screen_change,
+                                                &reader_last_content,
+                                                &reader_motion,
+                                                &output_count,
+                                            );
+                                        }
                                     }
                                     published_once = true;
                                     reader_cells_stale.store(false, Ordering::Relaxed);
@@ -1480,15 +1490,21 @@ crate::log_crash("reader-panic", &format!("VT 解析 panic（后台页签），�
                                             now_chars.len()
                                         };
                                         std::mem::swap(&mut prev_screen, &mut now_chars);
-                                        stamp_screen_activity(
-                                            diff,
-                                            now_ms,
-                                            &mut last_event_ms,
-                                            &reader_last_screen_change,
-                                            &reader_last_content,
-                                            &reader_motion,
-                                            &output_count,
-                                        );
+                                        // 同上：滚出来的变化不算内容（offset_val 已经
+                                        // 就是本块的视口偏移）。
+                                        let scrolled = offset_val != prev_offset;
+                                        prev_offset = offset_val;
+                                        if !scrolled {
+                                            stamp_screen_activity(
+                                                diff,
+                                                now_ms,
+                                                &mut last_event_ms,
+                                                &reader_last_screen_change,
+                                                &reader_last_content,
+                                                &reader_motion,
+                                                &output_count,
+                                            );
+                                        }
                                     }
                                     reader_cells_stale.store(true, Ordering::Relaxed);
                                 }
