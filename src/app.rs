@@ -8173,8 +8173,14 @@ impl eframe::App for ClientApp {
             let _ = std::fs::remove_file(exe.with_file_name(format!("{name}.running")));
         }
         // 记录打开中的终端页签（退出后下次启动自动重新拉起）。
-        // 规则与运行期随时落盘共用 current_tabs_state()，行为保持一致。
-        self.config.tabs = self.current_tabs_state();
+        // 规则与运行期随时落盘共用 current_tabs_state()，行为保持一致；
+        // 同样不允许把非空列表写成空（见 logic() 里 wipe_guard 的说明：
+        // 恢复失败后关窗不该把磁盘上待恢复的列表也清掉）。
+        let next_tabs = self.current_tabs_state();
+        if !next_tabs.dirs.is_empty() || self.config.tabs.dirs.is_empty() {
+            self.config.tabs = next_tabs;
+        }
+        // 注意：关光页签后重启会再恢复一次——宁可多恢复，不可一个都回不来。
         // 窗口状态已在每帧 logic 中记录；运行期已随时落盘，这里退出时保底一次。
         let _ = config::save(&self.config);
     }
@@ -8505,12 +8511,17 @@ let delay_ms = frame_delay_ms(interacting, busy);
         // 会算出空列表，提前写盘会把磁盘上待恢复的页签列表清空。
         let tabs_state = self.current_tabs_state();
         let tabs_changed = tabs_state != self.config.tabs;
+        // 自动落盘绝不把「有页签」写成「没页签」：恢复失败、会话全退、或还在启动
+        // 中时 current_tabs_state() 会算出空列表，写进磁盘等于把下次要恢复的列表
+        // 清掉（死机/断电后开机一个页签都回不来的直接原因）。真关光了页签时由
+        // on_exit 写空（正常关窗）；结束进程那种非正常退出宁可下次多恢复几个。
+        let wipe_guard = tabs_state.dirs.is_empty() && !self.config.tabs.dirs.is_empty();
         let settled = self.pending_launch.is_empty()
             && self.pending_restore.is_empty()
             && self.pending_relaunch.is_empty()
             && self.spawning.is_empty();
         let window_debounce_ok = self.last_config_save.elapsed() >= CONFIG_SAVE_INTERVAL;
-        if settled && (tabs_changed || (window_changed && window_debounce_ok)) {
+        if settled && ((tabs_changed && !wipe_guard) || (window_changed && window_debounce_ok)) {
             self.config.tabs = tabs_state;
             self.persist_config();
         }

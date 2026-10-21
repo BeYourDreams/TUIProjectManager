@@ -233,11 +233,25 @@ pub fn config_path() -> PathBuf {
 
 /// 加载配置；文件不存在或解析失败时返回默认配置。
 pub fn load() -> Config {
-    let path = config_path();
+    load_from(&config_dir())
+}
+
+/// 从指定配置目录加载（测试与 `save_to` 配对用；`load` 走 exe 同级 config/）。
+///
+/// 解析失败不静默清零：把坏文件改名成 `config.json.bad` 留证据再退默认。
+/// 否则下一次自动保存就把用户唯一那份配置盖掉——断电/死机后残留半截 JSON
+/// （或改名已落盘、内容还在系统缓存里）的典型后果是全量丢项目。
+pub fn load_from(dir: &std::path::Path) -> Config {
+    let path = dir.join("config.json");
     let mut config = match std::fs::read_to_string(&path) {
         Ok(raw) => match serde_json::from_str::<Config>(&raw) {
             Ok(c) => c,
-            Err(_) => Config::default(),
+            Err(_) => {
+                let bad = path.with_extension("json.bad");
+                let _ = std::fs::remove_file(&bad);
+                let _ = std::fs::rename(&path, &bad);
+                Config::default()
+            }
         },
         Err(_) => Config::default(),
     };
@@ -282,13 +296,24 @@ pub fn normalize_tui_commands(s: &mut Settings) {
 
 /// 保存配置到 config/config.json。
 pub fn save(config: &Config) -> Result<(), String> {
-    let dir = config_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    save_to(&config_dir(), config)
+}
+
+/// 写配置文件到指定目录（`save` 走 exe 同级 config/）。
+pub fn save_to(dir: &std::path::Path, config: &Config) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let json = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
-    // 先写临时文件再 rename：进程崩溃只会留 config.json.tmp，不会留半截 config.json。
-    let tmp = config_dir().join("config.json.tmp");
-    std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, config_path()).map_err(|e| e.to_string())
+    // 先写临时文件、fsync 再 rename：进程崩溃只会留 config.json.tmp，不会留半截
+    // config.json；fsync 防的是断电/死机——rename 只保证目录项落盘，内容还在系统
+    // 写缓存里时掉电会得到一个 0 字节或半截的文件（真丢整份配置）。
+    let tmp = dir.join("config.json.tmp");
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        f.write_all(json.as_bytes()).map_err(|e| e.to_string())?;
+        f.sync_all().map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(&tmp, dir.join("config.json")).map_err(|e| e.to_string())
 }
 
 // ── 模型配置（pi / oh-my-pi） ──────────────────────────────────────────
@@ -854,5 +879,47 @@ assert_eq!(d.base_url, "http://localhost:20128/v1");
         let old: Settings = serde_json::from_str(r#"{"tui_commands":["nvim"]}"#).unwrap();
         assert_eq!(old.project_sort, ProjectSort::Default);
         assert!(!old.show_hidden);
+    }
+
+    /// 每个测试一份独立临时目录（进程号 + 名字，避免并行测试互相踩）。
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("tpm-cfg-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 落盘/读回不能丢页签（死机后能否恢复全靠这份列表）。
+    #[test]
+    fn save_then_load_keeps_tabs() {
+        let dir = tmp_dir("roundtrip");
+        let mut cfg = Config::default();
+        cfg.tabs = TabsState {
+            dirs: vec![r"D:\a".into(), r"D:\b".into()],
+            cmds: vec!["pi.exe".into(), "pi.exe".into()],
+            active: 2,
+            settings_open: true,
+            settings_pos: 1,
+        };
+        save_to(&dir, &cfg).unwrap();
+        assert!(!dir.join("config.json.tmp").exists(), "临时文件应已被 rename 掉");
+        assert_eq!(load_from(&dir).tabs, cfg.tabs);
+    }
+
+    /// 半截 JSON（断电/死机的典型残留）不许被下一次保存直接盖掉：
+    /// 改名留证再退默认，否则用户唯一那份配置就没了。
+    #[test]
+    fn corrupt_config_is_kept_aside() {
+        let dir = tmp_dir("corrupt");
+        let path = dir.join("config.json");
+        let raw = r#"{"projects": [ {"name": "x""#;
+        std::fs::write(&path, raw).unwrap();
+
+        assert!(load_from(&dir).projects.is_empty(), "坏配置退回默认");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.json.bad")).unwrap(),
+            raw
+        );
+        assert!(!path.exists());
     }
 }
