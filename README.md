@@ -103,7 +103,7 @@
 
 字形图集（每页 1024² RGBA ≈ 4MB 内存 + 4MB 显存）由全进程共享：同一字体链与物理字号下所有页签共用一份位图与纹理，开第 2 个页签不再重复占用与重复光栅化，关掉最后一个页签即整体释放。字体、epi 字体图集本就是进程级的，多页签的额外开销只剩各页签自己的回看历史与帧缓冲。
 
-渲染后端不自己选：renderer 与 DX 版本都不指定，用 eframe 默认（wgpu，后端集合 DX12 → Vulkan → GL 依序试），适配器由 wgpu 挑：独显 → 核显 → WARP（没有硬件 GPU 时系统自带的 CPU 软件光栅器）。某台机器上厂商 ICD 一加载就崩（Intel 老 igvk64.dll）时设 `WGPU_BACKENDS=dx12`，不用改代码；wgpu 整个起不来时再重试一次 glow 保底。
+渲染后端固定用 glow（OpenGL 3.3+），不再编进 wgpu：曾交给系统挑 wgpu（DX12 → Vulkan → GL），但装了 ToDesk 虚拟显示器的机器在远程会话/显示器热插拔时会设备丢失，egui-wgpu 拿不到 staging buffer 直接 panic 闪退，而 eframe 0.36 没有设备重建路径。启动时把实际 GL 版本号写进 `crash.log` 的 `[renderer]` 行，闪退复盘看它。
 
 
 ## 从源码构建

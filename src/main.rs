@@ -235,38 +235,34 @@ log_crash("start", &format!("v{}", app_version()));
     if config.window.maximized {
         viewport = viewport.with_maximized(true);
     }
-// 不指定 renderer、不指定 backends、不指定适配器：全交给系统。
-    // eframe 默认 = wgpu，后端集合 `Backends::PRIMARY | GL`（Windows 上就是
-    // DX12 → Vulkan → GL 依序试），适配器由 wgpu 按 power preference 挑（独显
-    // → 核显 → WARP：系统自带的 CPU 软件光栅器）。程序不查显卡、不写死 DX 版本，
-    // 只负责告诉系统「该画了」（ctx.request_repaint）。
-    // ponytail: 某台机器上厂商 ICD 一加载就崩（Intel 老 igvk64.dll）时，别改代码，
-    // 设 `WGPU_BACKENDS=dx12` 即可（egui-wgpu 原生读这个环境变量）。
+// 渲染后端写死 glow（OpenGL 3.3+）。
+    // 曾经交给系统挑 wgpu：本机装了 ToDesk 虚拟显示器，远程会话/显示器热插拔会让
+    // wgpu 设备丢失，egui-wgpu 在 `queue.write_buffer_with` 拿到 None 时直接 panic
+    // （crash.log 实况：renderer.rs:981 "Failed to create staging buffer"），
+    // 主线程 panic 穿过 WindowProc → 窗口闪退。glow 期（10/07–10/15）crash.log 零 panic。
+    // wgpu 没有设备丢失重建路径（eframe 0.36），换回去也是等下一次闪退。
     let options = eframe::NativeOptions {
         viewport,
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
     let title = format!("TUI 项目管理器 v{}", app_version());
-    // 系统图形栈整个起不来时的最后一道保险：换 glow（OpenGL 3.3+，覆盖面比
-    // wgpu 老一些的驱动）。是失败后的重试，不是启动前替系统做选择。
-    let glow_fallback = eframe::NativeOptions {
-        renderer: eframe::Renderer::Glow,
-        ..options.clone()
-    };
-    match eframe::run_native(&title, options, Box::new(create_app)) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            // 无控制台可看时记入 crash.log（与 panic 钩子同一目录）
-            eprintln!("[renderer] wgpu 初始化失败，回退 glow：{err}");
-            log_crash("renderer", &format!("wgpu failed: {err}"));
-            eframe::run_native(&title, glow_fallback, Box::new(create_app))
-        }
-    }
+    eframe::run_native(&title, options, Box::new(create_app))
 }
 
-/// 创建应用实例；run_native 可能调用两次（默认图形栈失败后回退 glow）。
+/// 创建应用实例。
 fn create_app(
     cc: &eframe::CreationContext<'_>,
 ) -> Result<Box<dyn eframe::App>, Box<dyn std::error::Error + Send + Sync>> {
+    // 记图形栈实况：闪退复盘时「跑在什么渲染器/哪块卡上」比问用户更准。
+    let gl = cc
+        .gl
+        .as_ref()
+        .map(|gl| unsafe {
+            use eframe::glow::HasContext as _;
+            gl.get_parameter_string(eframe::glow::VERSION)
+        })
+        .unwrap_or_default();
+    log_crash("renderer", &format!("glow gl={gl:?}"));
     Ok(Box::new(app::ClientApp::new(cc)))
 }

@@ -7,12 +7,10 @@ edition = "2024"
 alacritty_terminal = "0.26"
 # 读剪贴板 CF_HDROP（资源管理器复制文件后的文件列表）；已是 arboard 的传递依赖，直接声明零新增编译。
 clipboard-win = "5.4"
-# 渲染后端：renderer 与 backends 全不指定，交给系统。eframe 默认走 wgpu，
-# 后端集合 PRIMARY|GL（Windows 上 DX12 → Vulkan → GL 依序试），适配器由 wgpu
-# 挑（独显 → 核显 → WARP，即系统自带的 CPU 软件光栅器）。glow 只作 wgpu 整个
-# 起不来时的重试路径。某台机器上厂商 ICD 一加载就崩时设 WGPU_BACKENDS=dx12。
+# 渲染后端只用 glow（OpenGL）：wgpu 在虚拟显示器（ToDesk）/远程会话热插拔时会
+# 设备丢失并 panic 闪退，而 eframe 0.36 没有设备重建路径。见 main.rs 的注释。
 # 不启 default_fonts（省 Ubuntu+NotoEmoji ~15MB）：基础字体用内嵌 HACK，见 setup_fonts。
-eframe = { version = "0.36.1", default-features = false, features = ["glow", "wgpu"] }
+eframe = { version = "0.36.1", default-features = false, features = ["glow"] }
 fontdue = "0.9"
 portable-pty = "0.9"
 raw-window-handle = "0.6"
