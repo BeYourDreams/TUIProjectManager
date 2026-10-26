@@ -250,22 +250,8 @@ pub struct Session {
     /// 的根源。0 = 从未变过。
     pub last_screen_change_ms: Arc<AtomicU64>,
     /// 最近一次「**成规模**内容变化」的时刻：单块变化 ≥ [`MIN_CONTENT_CELLS`]
-    /// 个可见格。完成/🔄 内容窗口只认它——秒表、时钟、动画小数位这类每次只改
-    /// 1~3 格的周期性刷新不算内容（否则永远「有内容」→ 🔄 常驻、✅ 亮不出来）。
+    /// 个可见格。只给「任务完成」通知侧的门槛用（图标不看它，只看上面那个）。
     pub last_content_ms: Arc<AtomicU64>,
-    /// 最近一次「**画面在连续快速动**」的时刻：两次画面变化事件的间隔
-    /// < [`MOTION_GAP_MS`]（spinner/进度条/流式打字/秒数跳动都落这里，
-    /// 由 reader 的 stamp_screen_activity 记）。
-    ///
-    /// 为什么要有它：`last_screen_change_ms` 只是「刚刚变了」的**瞬时**信号，
-    /// 而 app.rs 的判定被 STATE_CHECK_MS=1s 门限 + 心跳降频**采样**着看
-    /// （display 读的是每秒至多重算一次的快照）。250ms 的 ANIM_BUSY_MS
-    /// 窗口配 1s 采样 ⇒ 只要动画周期不是 1s 的整数倍，采样点大多数落在窗口外，
-    /// 🔄 掉成空（已查看页签）或误亮 ✅。实测：进度条 800ms 一跳 → 75% 的时间
-    /// 显示空。这里给「连续变化」一个能跨过采样间隔的保持窗口（app.rs
-    /// MOTION_HOLD_MS），并让它成为 state_due 的事件通道之一（画面在动就
-    /// 立刻重算，不等下一秒）。孤立的一次小变化（时钟每秒跳一格）不算它。
-    pub last_motion_ms: Arc<AtomicU64>,
     /// 「运行/完成」状态快照的上次重算时刻（毫秒）。门限 STATE_CHECK_MS（1s）：
     /// 每个页签最快一秒重算一次，其余帧复用快照——降低检测频率，也让图标不再
     /// 亚秒抖动（🔄↔✅ 来回闪）。
@@ -748,52 +734,25 @@ static OPENCONSOLE_EXE: &[u8] = include_bytes!("../assets/conpty/OpenConsole.exe
 /// 统一走 loading_active()：超过窗口后无论标志是否仍为 true 都不再显示加载态。
 const LOADING_MAX_MS: u64 = 5_000;
 
-/// 一块输出里至少这么多可见格变了，才算「内容变化」（刷 last_content_ms）。
-///
-/// 分档理由：命令输出/回答正文一次变几十上百格；秒表、时钟、动画小数位一次只
-/// 变 1~3 格，却每秒都来。若把它们也算内容，画面再静止 `last_content` 也永远
-/// 新鲜 → 🔄 常驻、✅ 亮不出来。4 格是分界：词级流式输出（4~6 格）算内容，
-/// 单字符 tick 不算。
-/// ponytail: 逐字动画（如逐格点阵 loader）会漏判成「静止」——真出现再降到 2。
+/// 一块变化里至少这么多可见格，才算「成规模内容」（刷 `last_content_ms`，只有
+/// 「任务完成」通知侧的门槛读它——页签图标看的是任意一格的变化）。
+/// 命令输出/回答正文一次变几十上百格；秒表/时钟/进度条一跳只改 1~3 格。
 const MIN_CONTENT_CELLS: usize = 4;
 
-/// 两次「画面变化事件」间隔短于此 ⇒ 画面在**连续快速动**（spinner 每 80~150ms
-/// 一帧、进度条每 200~500ms 跳一格、流式打字逐行刷）→ 刷
-/// [`Session::last_motion_ms`]，app.rs 用它兜住 🔄（MOTION_HOLD_MS）。
-///
-/// 上限 700ms 是为了**排除秒表/时钟**：它们每秒孤立跳 1~3 格，间隔 1000ms，
-/// 进不了这个窗口——保住 63f1756 之后「1Hz 秒表不钉 🔄、✅ 如期亮起」的语义。
-/// 取中间值（而不是贴着 1000ms）是为留余量：≤600ms 一跳的画面刷新（慢进度条、
-/// 逐行刷新）仍算「在动」，1s 一跳的归时钟类。**1Hz 刷新在屏幕上与时钟不可区分**，
-/// 这是纯屏幕启发式的固有边界，真要判「在跑」只能靠进程存活/CPU 采样
-/// （63f1756 已移除）。
-const MOTION_GAP_MS: u64 = 700;
-
-/// 同一次重绘的块间合并窗：一次整屏重绘常被 `read()` 切成相邻几块，逐块计时
-/// 会把「1Hz 秒表」数成「每 100ms 都在动」→ 🔄 常驻。间隔小于此值的连续变化
-/// 视为同一次重绘，不另起变化事件。
-const SCREEN_EVENT_MERGE_MS: u64 = 250;
-
-/// 逐块比对可见格 → 刷「画面在动 / 成规模内容 / 连续小变化」三个时间戳。
+/// 逐块比对可见格 → 刷「画面在动 / 成规模内容」两个时间戳。
 /// 前台（build_snapshot）与后台（display_iter）两条快照路径共用，避免两份口径
 /// 漂移（历史上两端口径不一致会让切页时误判整屏变化）。
 ///
 /// - `diff == 0`：整屏重画同样的字 → 一个时间戳都不刷。这正是「明明静止却
 ///   常亮 🔄、✅ 永远不亮」的成因。
-/// - `diff >= MIN_CONTENT_CELLS`：成规模内容 → 刷 `last_content_ms`（3s 窗口），
-///   调用方（读循环）在视口偏移变化（滚轮）时直接跳过本函数：滚出来的变化不是内容。
-///   并把 `output_count` 顶到 ≥1：✅/🔄 的「有内容」门槛不该由**动画分类器**
-///   （转义占比 >0.5）决定——带 SGR 高亮的输出（每 token 一个颜色）整轮都会被
-///   判成动画而不计数，页签跑完只剩空图标、亮不出 ✅。
-/// - `0 < diff < MIN_CONTENT_CELLS`：只刷「画面在动」；若它与上一次变化事件
-///   间隔 < [`MOTION_GAP_MS`]，另刷 `last_motion_ms`（连续在动）。
+/// - `diff >= MIN_CONTENT_CELLS`：另刷 `last_content_ms` 并把 `output_count` 顶到
+///   ≥1（通知侧的门槛由它管）。
+/// - 任意 `diff > 0`：刷 `last_screen_change_ms`——页签 🔄/✅ 只看它。
 pub(crate) fn stamp_screen_activity(
     diff: usize,
     now_ms: u64,
-    last_event_ms: &mut u64,
     screen: &AtomicU64,
     content: &AtomicU64,
-    motion: &AtomicU64,
     output_count: &AtomicU32,
 ) {
     if diff == 0 {
@@ -806,14 +765,6 @@ pub(crate) fn stamp_screen_activity(
             output_count.store(1, Ordering::Relaxed);
         }
     }
-    // 同一次重绘的后续块（间隔 < 合并窗）不另起事件，只推进「画面在动」。
-    if now_ms.saturating_sub(*last_event_ms) < SCREEN_EVENT_MERGE_MS {
-        return;
-    }
-    if *last_event_ms != 0 && now_ms - *last_event_ms < MOTION_GAP_MS {
-        motion.store(now_ms, Ordering::Relaxed);
-    }
-    *last_event_ms = now_ms;
 }
 
 #[cfg(windows)]
@@ -1037,7 +988,6 @@ sel_range: None,
     let last_scroll_ms = Arc::new(AtomicU64::new(0));
     let last_screen_change_ms = Arc::new(AtomicU64::new(0));
     let last_content_ms = Arc::new(AtomicU64::new(0));
-    let last_motion_ms = Arc::new(AtomicU64::new(0));
     // 状态快照：首帧由 app.rs 的 refresh_tab_state 填（门限 1s）。
     let state_check_ms = Arc::new(AtomicU64::new(0));
     let state_icon = Arc::new(AtomicU8::new(0));
@@ -1060,7 +1010,6 @@ sel_range: None,
         let last_output_ms = last_output_ms.clone();
     let reader_last_screen_change = last_screen_change_ms.clone();
         let reader_last_content = last_content_ms.clone();
-    let reader_motion = last_motion_ms.clone();
         let reader_input_ms = last_input_ms.clone();
         let reader_fg = foreground.clone();
         let reader_loading = loading.clone();
@@ -1095,7 +1044,6 @@ let mut last_chunk_ms: u64 = 0;
             let mut prev_screen: Vec<char> = Vec::new();
             // 上一次「画面变化事件」的时刻（stamp_screen_activity 用）：判
             // 「画面是否在连续快速动」，同一次重绘的相邻块按合并窗折叠。
-            let mut last_event_ms: u64 = 0;
             // 上一次的快照视口偏移（scrollback 行数）：滚轮只改视口，滚出来的
             // 可见格变化不是新内容，不得刷新内容/画面时间戳（否则滚一下页签就
             // 🔄 3s、✅ 被推后 8s——用户反馈「滚轮改写页签状态」）。
@@ -1255,7 +1203,7 @@ crate::log_crash("reader-panic", &format!("VT 解析 panic（残留块），会�
                         if is_animation {
                             // 纯动画块（转义重绘/spinner/时钟）：刷「画面还在动」
                             // 时间戳。高频来 ⇒ 还在思考/跑命令，完成判定据此否决
-                            // （空闲时的光标闪烁稀疏，不会误否决，见 ANIM_BUSY_MS）。
+                            // （空闲时的光标闪烁稀疏，不会误否决通知门槛）。
                         } else {
                             // 实质内容块：刷「最近实质内容」时间戳——完成/通知判据
                             // 只认它（周期转义重绘不产生实质内容 → 永不误判完成）。
@@ -1449,10 +1397,8 @@ crate::log_crash("reader-panic", &format!("VT 解析 panic（后台页签），�
                                             stamp_screen_activity(
                                                 diff,
                                                 now_ms,
-                                                &mut last_event_ms,
                                                 &reader_last_screen_change,
                                                 &reader_last_content,
-                                                &reader_motion,
                                                 &output_count,
                                             );
                                         }
@@ -1498,10 +1444,8 @@ crate::log_crash("reader-panic", &format!("VT 解析 panic（后台页签），�
                                             stamp_screen_activity(
                                                 diff,
                                                 now_ms,
-                                                &mut last_event_ms,
                                                 &reader_last_screen_change,
                                                 &reader_last_content,
-                                                &reader_motion,
                                                 &output_count,
                                             );
                                         }
@@ -1570,7 +1514,6 @@ guard_ctx.request_repaint();
         last_scroll_ms,
         last_screen_change_ms,
         last_content_ms,
-        last_motion_ms,
         state_check_ms,
         state_icon,
         state_done,
@@ -1668,73 +1611,37 @@ mod tests {
 use super::*;
     use alacritty_terminal::term::cell::Flags;
 
-    /// 屏幕变化 → 三个时间戳的记账约定（app.rs tab_icon/state_due 的输入源）。
-    /// ① 零变化：整屏重画同样的字，一个时间戳都不刷（「静止却常亮 🔄」的根因）；
-    /// ② ≥MIN_CONTENT_CELLS 格：刷内容时间戳，并把 output_count 顶到 ≥1
-    ///    （带 SGR 高亮的输出整轮会被动画分类器判成「动画」，若只靠它计数，
-    ///    页签跑完只能落空、亮不出 ✅）；
-    /// ③ 1~3 格的小变化：只刷「画面在动」；连续两次（间隔 <MOTION_GAP_MS）
-    ///    才算「在连续动」——1Hz 秒表/时钟必须留在外面。
+    /// 屏幕变化 → 两个时间戳的记账约定（app.rs tab_icon 的输入源）。
+    /// ① 零变化（整屏重画同样的字）：一个时间戳都不刷——「静止却常亮 🔄」的根因；
+    /// ② 任意 ≥1 格变化：刷 last_screen_change_ms（页签 🔄/✅ 只看它）；
+    /// ③ ≥MIN_CONTENT_CELLS 格：另刷 content 并把 output_count 顶到 ≥1（通知侧门槛）。
     #[test]
     fn stamp_screen_activity_semantics() {
         let screen = AtomicU64::new(0);
         let content = AtomicU64::new(0);
-        let motion = AtomicU64::new(0);
         let count = AtomicU32::new(0);
-        let mut ev = 0u64;
-        let mut call = |diff: usize, t: u64| {
-            stamp_screen_activity(diff, t, &mut ev, &screen, &content, &motion, &count);
+        let call = |diff: usize, t: u64| {
+            stamp_screen_activity(diff, t, &screen, &content, &count);
         };
 
         // ① 零变化：全都不动。
         call(0, 1_000);
         assert_eq!(
-            (
-                screen.load(Ordering::Relaxed),
-                content.load(Ordering::Relaxed),
-                motion.load(Ordering::Relaxed)
-            ),
-            (0, 0, 0)
+            (screen.load(Ordering::Relaxed), content.load(Ordering::Relaxed)),
+            (0, 0)
         );
 
-        // ② 成规模变化：刷内容 + 计数；第一次没有「上一次事件」，不算连续动。
-        call(MIN_CONTENT_CELLS, 2_000);
-        assert_eq!(content.load(Ordering::Relaxed), 2_000);
-        assert_eq!(count.load(Ordering::Relaxed), 1);
-        assert_eq!(motion.load(Ordering::Relaxed), 0);
-
-        // ③ 孤立小变化（1000ms 后）：只刷「画面在动」，不进 motion。
+        // ② 1~3 格的小变化（进度条一跳 / 秒表一秒）：算「屏幕变过」。
+        //    这条正是「git pull 已亮 ✅ 而进度还在刷」的回归——以前只算 motion。
         call(2, 3_000);
         assert_eq!(screen.load(Ordering::Relaxed), 3_000);
-        assert_eq!(motion.load(Ordering::Relaxed), 0, "1Hz 秒表不算「连续在动」");
+        assert_eq!(content.load(Ordering::Relaxed), 0, "小变化不算成规模内容");
 
-        // 同一次重绘被 read 切成相邻块（间隔 <合并窗）：不另起事件、不算 motion。
-        call(1, 3_100);
-        call(1, 3_200);
-        assert_eq!(motion.load(Ordering::Relaxed), 0);
-
-        // 300ms 后再跳一格 → 与上一次事件间隔 300ms <MOTION_GAP_MS ⇒ 连续在动。
-        call(1, 3_300 + 300);
-        assert_eq!(motion.load(Ordering::Relaxed), 3_600);
-    }
-
-    /// 变化事件合并窗：一次重绘被切成多块时不能被数成「多次变化」——否则
-    /// 1Hz 秒表（整屏重绘分 3 块写）会被误判成「连续在动」→ 🔄 常驻。
-    #[test]
-    fn stamp_screen_activity_merges_chunks_of_one_repaint() {
-        let screen = AtomicU64::new(0);
-        let content = AtomicU64::new(0);
-        let motion = AtomicU64::new(0);
-        let count = AtomicU32::new(0);
-        let mut ev = 0u64;
-        for (i, t) in [1_000u64, 1_050, 1_100].iter().enumerate() {
-            stamp_screen_activity(1, *t, &mut ev, &screen, &content, &motion, &count);
-            if i == 0 {
-                assert_eq!(ev, 1_000, "首个变化起一个事件");
-            }
-        }
-        assert_eq!(ev, 1_000, "50ms 内的相邻块应折叠进同一次重绘");
-        assert_eq!(motion.load(Ordering::Relaxed), 0);
+        // ③ 成规模变化：两个时间戳都刷 + 计数。
+        call(MIN_CONTENT_CELLS, 4_000);
+        assert_eq!(screen.load(Ordering::Relaxed), 4_000);
+        assert_eq!(content.load(Ordering::Relaxed), 4_000);
+        assert_eq!(count.load(Ordering::Relaxed), 1);
     }
 
     /// 卡死回归（出现过多次）：VT 解析 panic 会带走整条 reader 线程 →
