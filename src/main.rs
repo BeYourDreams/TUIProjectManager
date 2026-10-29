@@ -79,15 +79,20 @@ pub fn app_is_foreground(hwnd: isize, focused_fallback: bool) -> bool {
 
 /// 运行结束系统通知：PowerShell WinRT toast，免安装器（无 AUMID 注册）也能显示。
 /// Win10 2004+ / Win11 会静默丢弃未注册 AppUserModelID 的 toast——非激活时的
-/// 提示之所以失效，就是 AppId 没注册。启动时 ensure_toast_registered() 往
-/// HKCU\Software\Classes\AppUserModelId\<AUMID>\CustomActivator 埋注册项
+/// 提示之所以失效，就是 AppId 没注册。首次要发通知前 ensure_toast_registered()
+/// 往 HKCU\Software\Classes\AppUserModelId\<AUMID>\CustomActivator 埋注册项
 /// （Microsoft 文档：unpackaged 桌面应用两种注册方式之一，reg 一个 CLSID 即
 /// 可；点按激活让系统处理即可，本应用不接 toast 激活回调），以后显示就走
 /// 这个固定 AUMID。CREATE_NO_WINDOW 启动，不闪控制台。
 pub const TOAST_AUMID: &str = "TUIProjectManager.Toast";
 
-/// STARTUP 时幂等注册 toast AUMID（best-effort，失败静默：下次启动再试）。
+/// 注册一次 AUMID（每进程只做一次，best-effort，失败静默）。
+/// 只在真的要发通知时才调（设置里关掉通知就一个 PowerShell 都不起）。
 pub fn ensure_toast_registered() {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let script = format!(
@@ -219,7 +224,6 @@ fn main() -> eframe::Result {
         default_hook(info);
     }));
     unlock_exe();
-    ensure_toast_registered();
 log_crash("start", &format!("v{}", app_version()));
     let config = config::load();
     let mut viewport = egui::ViewportBuilder::default()

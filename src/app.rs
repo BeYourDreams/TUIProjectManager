@@ -4638,6 +4638,11 @@ fn move_tab(&mut self, from: usize, target: usize) {
     fn update_done_states(&mut self, ctx: &egui::Context) {
         let now_ms = crate::now_ms();
         let app_fg = crate::app_is_foreground(self.titlebar_hwnd, ctx.input(|i| i.focused));
+        // 提醒开关（先拷出来：循环里握着 self.tabs 的可变借用）。
+        let (toast_on, flash_on) = (
+            self.config.settings.notify_toast,
+            self.config.settings.notify_flash,
+        );
         for (i, tab) in self.tabs.iter().enumerate() {
             if let Tab::Session(s) = tab {
                 // 完成态 = 与图标同一判据：只有图标码为 ✅ 的快照才为 true
@@ -4687,8 +4692,8 @@ fn move_tab(&mut self, from: usize, target: usize) {
                         && now_ms.saturating_sub(s.started_ms.load(Ordering::Relaxed))
                             >= STARTUP_GRACE_MS
                     {
-                        crate::notify_run_finished(&s.title, "任务完成");
-                        crate::flash_taskbar(self.titlebar_hwnd);
+                        let title = s.title.clone();
+                        Self::alert_finished(&title, "任务完成", toast_on, flash_on, self.titlebar_hwnd);
                     }
                 } else {
                     // 离开完成态（新一轮输出/启动加载中/已退出）→ 清稳定计时并
@@ -4704,6 +4709,10 @@ fn move_tab(&mut self, from: usize, target: usize) {
     fn update_exited(&mut self, ctx: &egui::Context) -> bool {
         let now_ms = crate::now_ms();
         let app_fg = crate::app_is_foreground(self.titlebar_hwnd, ctx.input(|i| i.focused));
+        let (toast_on, flash_on) = (
+            self.config.settings.notify_toast,
+            self.config.settings.notify_flash,
+        );
         let mut changed = false;
         for (i, tab) in self.tabs.iter_mut().enumerate() {
             if let Tab::Session(s) = tab {
@@ -4759,13 +4768,30 @@ s.last_reap_ms.store(now_ms, Ordering::Relaxed);
                         && now_ms.saturating_sub(s.started_ms.load(Ordering::Relaxed))
                             >= STARTUP_GRACE_MS
                     {
-                        crate::notify_run_finished(&s.title, "运行结束");
-                        crate::flash_taskbar(self.titlebar_hwnd);
+        // 借用分离：s 还被 iter_mut 借着，先把标题拷出来再调。
+                        let title = s.title.clone();
+                        Self::alert_finished(&title, "运行结束", toast_on, flash_on, self.titlebar_hwnd);
                     }
                 }
             }
         }
         changed
+    }
+
+    /// 一条「结束」提醒的唯一出口：按设置决定发系统 toast / 闪任务栏 / 都不做。
+    /// 两个开关都关时只剩页签 ✅ 图标——本函数什么也不发。
+    /// 写成自由函数（不取 &self）：调用点都握着 `self.tabs` 的可变借用，
+    /// 再借 &self 会撞 borrow checker。
+    /// toast 要拉一个 PowerShell 进程（还要先注册 AUMID），所以注册只在开着
+    /// 的时候做一次；关掉通知时这行零开销。
+    fn alert_finished(title: &str, heading: &str, toast: bool, flash: bool, hwnd: isize) {
+        if toast {
+            crate::ensure_toast_registered();
+            crate::notify_run_finished(title, heading);
+        }
+        if flash {
+            crate::flash_taskbar(hwnd);
+        }
     }
 
     fn commit_input(&mut self, dialog: InputDialog) {
@@ -6203,24 +6229,48 @@ match self.config.settings.project_sort {
         // 悬停激活窗口（焦点随鼠标）——30 FPS 输出中实测失效、10 FPS 正常（见
         // 921f062/0ae5904）。根治 = 去掉可调档，锁死 10 FPS（BUSY_FRAME_MS）。
         ui.add_space(12.0);
-        ui.label(RichText::new("🔄 = 正在运行（有输出内容 / 进程树在计算），✅ = 输出结束待查看（切到该页签、或在页签内点击/滚动/输入即消失；失焦/回焦不算「看过」，窗口没回到屏幕前就不会被抹掉；TUI 静止等输入不算，显示空），空 = 等待输入或空闲，❌ = 已退出。\n🔄 以是否有输出内容为准，按键/粘贴等人工输入不算输出、保持空不误判 🔄；零输出页签不闪 🔄；✅ 稳定停留 2 秒后，满足「静默 ≥10s + 有实质输出 + 未查看 + 非当前页签/窗口失焦」才弹系统通知并闪烁任务栏。\n快捷键：Ctrl+Tab 循环切换到下一个页签，Ctrl+Shift+Tab 切换到上一个（只在项目页签之间循环，不会切到首页/设置页）。").weak());
+        ui.label(RichText::new("🔄 = 正在运行（有输出内容 / 进程树在计算），✅ = 输出结束待查看（切到该页签、或在页签内点击/滚动/输入即消失；失焦/回焦不算「看过」，窗口没回到屏幕前就不会被抹掉；TUI 静止等输入不算，显示空），空 = 等待输入或空闲，❌ = 已退出。\n🔄 以是否有输出内容为准，按键/粘贴等人工输入不算输出、保持空不误判 🔄；零输出页签不闪 🔄；✅ 稳定停留 2 秒后，满足「静默 ≥10s + 有实质输出 + 未查看 + 非当前页签/窗口失焦」才按上面「🔔 提醒」里开的开关提醒（系统通知 / 任务栏闪烁，默认都开）。\n快捷键：Ctrl+Tab 循环切换到下一个页签，Ctrl+Shift+Tab 切换到上一个（只在项目页签之间循环，不会切到首页/设置页）。").weak());
 ui.add_space(12.0);
         ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
     }
 
-    /// 设置页的「通知」区：说明「运行结束」与「任务完成」通知的规则。
-    /// 「任务完成」系统通知已默认启用，此处不再提供开关。
+    /// 设置页的「提醒」区：系统通知 / 任务栏闪烁两个开关 + 规则说明。
+    /// 两个都可独立关：全关 = 只剩页签 ✅ 图标（提醒这件事本身没有开关，
+    /// 判据与图标同源，关提醒等于关掉状态机的输出）。
     fn notify_section_ui(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("🔔 通知").strong());
+        ui.label(RichText::new("🔔 提醒").strong());
+        let mut toast = self.config.settings.notify_toast;
+        let mut flash = self.config.settings.notify_flash;
+        let mut dirty = false;
+        if ui
+            .checkbox(&mut toast, "系统通知")
+            .on_hover_text("Windows 通知中心弹 toast（首次弹之前会在 HKCU 注册一次 AppUserModelID）")
+            .changed()
+        {
+            dirty = true;
+        }
+        if ui
+            .checkbox(&mut flash, "任务栏闪烁")
+            .on_hover_text("任务栏图标持续闪到窗口回到前台")
+            .changed()
+        {
+            dirty = true;
+        }
         ui.label(
             RichText::new(
-                "「运行结束」（子进程真的退出时）始终弹通知，「任务完成」（终端静默启发式）默认弹通知并闪烁任务栏。\n\
+                "「运行结束」（子进程真的退出时）与「任务完成」（终端静默启发式）都走这两个开关；\
+                 两个都关就只剩页签 ✅ 图标。\n\
                  免除提醒的只有「人正看着」的那一页（当前页签**且**应用在前台）；\n\
-                 应用失焦时当前页签同样会亮 ✅、同样会弹通知。",
+                 应用失焦时当前页签同样会亮 ✅、同样会提醒。",
             )
             .weak()
             .small(),
         );
+        if dirty {
+            self.config.settings.notify_toast = toast;
+            self.config.settings.notify_flash = flash;
+            self.save_config("提醒设置已保存".to_string());
+        }
     }
 
     /// 进设置页时读一次「上次展开哪一块」（egui persisted，与折叠状态一样跨重

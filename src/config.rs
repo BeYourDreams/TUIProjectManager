@@ -141,6 +141,11 @@ pub struct Settings {
     /// 首页是否显示隐藏项目（记住上次选择）。
     #[serde(default)]
     pub show_hidden: bool,
+    /// 提醒方式：系统 toast 通知 / 任务栏闪烁（可都开关；两个都关 = 只有页签 ✅）。
+    #[serde(default = "default_true")]
+    pub notify_toast: bool,
+    #[serde(default = "default_true")]
+    pub notify_flash: bool,
 }
 
 /// 首页项目列表排序模式。升/降序仅作用于显示层（按名称首字），不修改
@@ -170,6 +175,8 @@ tool_paths: Vec::new(),
             tool_search_path: true,
             project_sort: ProjectSort::default(),
             show_hidden: false,
+            notify_toast: true,
+            notify_flash: true,
         }
     }
 }
@@ -881,7 +888,22 @@ assert_eq!(d.base_url, "http://localhost:20128/v1");
         assert!(!old.show_hidden);
     }
 
-    /// 每个测试一份独立临时目录（进程号 + 名字，避免并行测试互相踩）。
+    /// 提醒开关：默认两个都开；旧配置没这两字段时也必须是 true（否则老用户
+    /// 升级后提醒莫名消失）。
+    #[test]
+    fn settings_round_trip_notify_switches() {
+        let d = Settings::default();
+        assert!(d.notify_toast && d.notify_flash);
+        let mut s = Settings::default();
+        s.notify_toast = false;
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert!(!back.notify_toast && back.notify_flash);
+        let old: Settings = serde_json::from_str(r#"{"tui_commands":["nvim"]}"#).unwrap();
+        assert!(old.notify_toast && old.notify_flash);
+    }
+
+    /// 每个测试一份独立临时目录
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("tpm-cfg-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
