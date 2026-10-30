@@ -3381,6 +3381,7 @@ fn tab_icon(
     viewed: bool,
     last_change: u64,
     now_ms: u64,
+    done_quiet_ms: u64,
 ) -> Option<&'static str> {
     if exited {
         return Some("❌");
@@ -3388,11 +3389,11 @@ fn tab_icon(
     if loading {
         return Some("🔄");
     }
-    // 静默门槛（DONE_QUIET_MS）看**屏幕上任何一次变化**：`git pull` 的
+    // 静默门槛（done_quiet_ms）看**屏幕上任何一次变化**：`git pull` 的
     // `Receiving objects: 12% (1/8)` 每跳只改 1~3 格，只认成规模内容就会在 ✅
     // 亮着的同时让进度照爬（用户反馈「页签需要忠实显示实际状态」）。
     // last_change=0（从未变过）时不算新鲜，零输出会话不参与完成判定。
-    if last_change != 0 && now_ms.saturating_sub(last_change) < DONE_QUIET_MS {
+    if last_change != 0 && now_ms.saturating_sub(last_change) < done_quiet_ms {
         return Some("🔄");
     }
     if count > 0 && !viewed && last_change != 0 {
@@ -3463,7 +3464,7 @@ fn state_due(
 ///
 /// 页签图标（tab_bar）与「任务完成」通知（update_done_states）都只读这份快照，
 /// 1s 门限也只在这里生效一次——两个消费者因此永远不会互相矛盾。
-fn refresh_tab_state(s: &crate::session::Session, now_ms: u64) {
+fn refresh_tab_state(s: &crate::session::Session, now_ms: u64, done_quiet_ms: u64) {
     let last_check = s.state_check_ms.load(Ordering::Relaxed);
     let snap = s.state_icon.load(Ordering::Relaxed);
     let exited = s.exited.load(Ordering::Acquire);
@@ -3485,6 +3486,7 @@ fn refresh_tab_state(s: &crate::session::Session, now_ms: u64) {
         s.has_been_viewed.load(Ordering::Relaxed),
         last_change,
         now_ms,
+        done_quiet_ms,
     ));
     let flags = ((exited as u8) * SNAP_EXITED) | ((loading as u8) * SNAP_LOADING);
     s.state_icon.store(code | flags, Ordering::Relaxed);
@@ -4652,7 +4654,7 @@ fn move_tab(&mut self, from: usize, target: usize) {
                 // 不会因 done 横跳而循环弹「任务完成」+ 闪烁；画面高频动负责
                 // 屏幕还在变就挡在完成之外（见 DONE_QUIET_MS）。
                 // 最快 1s 重算一次，见 refresh_tab_state。
-                refresh_tab_state(s, now_ms);
+                refresh_tab_state(s, now_ms, self.config.settings.done_quiet_ms);
                 let done = s.state_done.load(Ordering::Relaxed);
                 // 「执行完成」提醒：进入完成态后需稳定停留 DONE_STABLE_MS（2s）
                 // 才弹系统通知 + 任务栏闪烁。稳定窗口过滤误触发：周期输出在
@@ -5193,7 +5195,7 @@ pad: tab_margin.left as f32 + tab_margin.right as f32,
                     // 判定只看终端输出，没有「用户驱动例外」。
                     // 状态快照：最快 1s 重算一次（STATE_CHECK_MS），退出/加载/
                     // 新实质内容这三类事件不等门限（见 state_due）。
-refresh_tab_state(s, now_ms);
+refresh_tab_state(s, now_ms, self.config.settings.done_quiet_ms);
 let icon = tab_icon_from_snap(s, s.has_been_viewed.load(Ordering::Relaxed));
                     let title = s.title.clone();
                     let selected = self.current == i;
@@ -8823,7 +8825,7 @@ mod tab_icon_tests {
     /// 只喂「屏幕最后一次变化距今多久」+「是否已查看」。
     fn icon(count: u32, viewed: bool, silent_ms: u64) -> Option<&'static str> {
         let now = 100_000u64;
-        tab_icon(false, false, count, viewed, now - silent_ms, now)
+        tab_icon(false, false, count, viewed, now - silent_ms, now, DONE_QUIET_MS)
     }
 
     // 屏幕刚变过 → 🔄（count=0 也算：用户刚敲完命令输出一行提示符）。
@@ -8864,17 +8866,17 @@ mod tab_icon_tests {
     #[test]
     fn exited_and_loading_override() {
         let now = 100_000u64;
-        assert_eq!(tab_icon(true, false, 10, false, now, now), Some("❌"));
-        assert_eq!(tab_icon(false, true, 10, false, now, now), Some("🔄"));
+assert_eq!(tab_icon(true, false, 10, false, now, now, DONE_QUIET_MS), Some("❌"));
+assert_eq!(tab_icon(false, true, 10, false, now, now, DONE_QUIET_MS), Some("🔄"));
         // 静止 10s 也已退出 → ❌ 压过 ✅。
-        assert_eq!(tab_icon(true, false, 10, false, now - 10_000, now), Some("❌"));
+assert_eq!(tab_icon(true, false, 10, false, now - 10_000, now, DONE_QUIET_MS), Some("❌"));
     }
 
     // 零变化会话（时间戳恒 0）不假闪 🔄、也不亮 ✅：没内容可看。
     #[test]
     fn never_changed_session_shows_nothing() {
-        assert_eq!(tab_icon(false, false, 0, false, 0, 100_000), None);
-        assert_eq!(tab_icon(false, false, 10, false, 0, 100_000), None);
+assert_eq!(tab_icon(false, false, 0, false, 0, 100_000, DONE_QUIET_MS), None);
+assert_eq!(tab_icon(false, false, 10, false, 0, 100_000, DONE_QUIET_MS), None);
     }
 
     // 整屏重画同样的字 = diff 0 → reader 不刷时间戳 → 过门槛就是 ✅。
@@ -8937,7 +8939,7 @@ mod tab_icon_tests {
             // 最坏相位：变化刚发生在两个采样点正中间。
             let age = tick / 2;
             assert_eq!(
-                tab_icon(false, false, 1, true, now - age, now),
+                tab_icon(false, false, 1, true, now - age, now, DONE_QUIET_MS),
                 Some("🔄"),
                 "tick={tick}ms：画面在变就必须恒 🔄，不许掉成空"
             );

@@ -85,6 +85,11 @@ fn default_history_lines() -> u32 {
 fn default_true() -> bool {
     true
 }
+fn default_done_quiet_ms() -> u64 {
+    8_000
+}
+
+
 
 /// TUI 启动命令的**等价键**：去首尾空白与引号 → 只取命令本身（忽略参数）
 /// → 取路径末段文件名 → 去 `.exe` 后缀（不区分大小写）→ 折叠空白 → 小写。
@@ -146,6 +151,10 @@ pub struct Settings {
     pub notify_toast: bool,
     #[serde(default = "default_true")]
     pub notify_flash: bool,
+
+    /// 延迟静默门槛（毫秒）：屏幕任一可见格不变满此时间后才判完成，✅ 图标才会亮起。
+    #[serde(default = "default_done_quiet_ms")]
+    pub done_quiet_ms: u64,
 }
 
 /// 首页项目列表排序模式。升/降序仅作用于显示层（按名称首字），不修改
@@ -177,6 +186,8 @@ tool_paths: Vec::new(),
             show_hidden: false,
             notify_toast: true,
             notify_flash: true,
+
+            done_quiet_ms: default_done_quiet_ms(),
         }
     }
 }
