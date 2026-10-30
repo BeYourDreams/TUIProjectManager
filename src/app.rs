@@ -21,6 +21,10 @@ const STARTUP_GRACE_MS: u64 = 10_000;
 /// 最多每 CONFIG_SAVE_INTERVAL 写盘一次；页签结构变化、显式保存都立即落盘。
 const CONFIG_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// 定期检查更新的间隔：只在启动（一次）+ 此后每 10 分钟静默检查。
+/// 以前新开页签也会顺带触发一次全量检查，等于「用得越勤查得越勤」。
+const UPDATE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// 全部静止时的慢心跳帧间隔（cmd/conhost 式节能：无脏区不持续重绘）。
 /// 输出到达、鼠标/键盘事件都走 request_repaint() 即时唤醒，心跳只负责
 /// 兜底捕获无事件干系的状态推进（任务完成通知稳定窗口、状态栏倒计时等）。
@@ -3303,6 +3307,9 @@ pub struct ClientApp {
     titlebar_restore_at: Option<std::time::Instant>,
     /// 上次配置成功落盘时刻：窗口拖动/缩放变化时按它节流（见 CONFIG_SAVE_INTERVAL）。
     last_config_save: std::time::Instant,
+    /// 上次发起更新检查的时刻：定期检查按 [`UPDATE_CHECK_INTERVAL`] 节流，
+    /// 手动点「🔄 检查更新」也刷新它（免得刚点完 1 秒后定期检查又发一遍）。
+    last_update_check: std::time::Instant,
     /// 连续落盘失败标记：每个失败区间只在状态栏提示一次，避免反复刷屏。
     config_save_failed: bool,
     /// 终端会话用 egui 上下文做 OSC 52 剪贴板写入并传给后台解析线程。
@@ -3973,6 +3980,7 @@ restore_active: None,
             last_theme_dark: initial_dark,
             titlebar_restore_at: None,
             last_config_save: std::time::Instant::now(),
+            last_update_check: std::time::Instant::now(),
             config_save_failed: false,
 
             ctx,
@@ -4187,10 +4195,11 @@ fn strip_geom_for_frame(
     }
 
     /// 异步检查 GitHub Release 最新版本，结果回到状态栏（不弹窗，只显示在窗口底部）。
-    /// silent=true（启动/新开页签自动检查）时不覆盖当前状态栏消息。
+    /// silent=true（启动首检与每 10 分钟的定期检查）时不覆盖当前状态栏消息。
     /// 同时顺带检查 pi / opencode（同一份源表、同一线程内串行，避免启动时
     /// 一次拉起 3×12 个 curl 进程），结果各自变成状态栏的下载按钮。
     fn check_updates(&mut self, silent: bool) {
+        self.last_update_check = std::time::Instant::now();
         if !silent {
             self.status = Some("正在检查更新…".to_string());
         }
@@ -8326,7 +8335,12 @@ impl eframe::App for ClientApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 标题栏固定黑色：启动时设一次 + 主题切换时补设（见下），不每帧轮询
+        // 定期静默检查更新：每 UPDATE_CHECK_INTERVAL 一次（空闲心跳 500ms，
+        // 所以准点到；不弹窗，结果只进状态栏）。
+        if self.last_update_check.elapsed() >= UPDATE_CHECK_INTERVAL {
+            self.check_updates(true);
+        }
+
         // （DwmSetWindowAttribute 触发 DWM 重算非客户区，重置 winit 的 hover 跟踪
         // → 「鼠标悬停激活窗口」失效）。补设走延迟时刻：egui 深浅切换会在帧尾经
         // ViewportCommand::SetTheme 让 winit SetWindowTheme("") 复位标题栏为浅色，
@@ -8740,7 +8754,6 @@ let delay_ms = frame_delay_ms(interacting, busy);
                     });
                 }
                 self.screen = Screen::Main;
-                self.check_updates(true);
             }
             // 轮询后台 spawn 结果：先收进临时列表，再逐条处理，避免 &rx 与 &mut self 借用冲突。
             let mut spawn_results: Vec<SpawnResult> = Vec::new();
