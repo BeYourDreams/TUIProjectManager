@@ -748,14 +748,21 @@ const MIN_CONTENT_CELLS: usize = 4;
 /// - `diff >= MIN_CONTENT_CELLS`：另刷 `last_content_ms` 并把 `output_count` 顶到
 ///   ≥1（通知侧的门槛由它管）。
 /// - 任意 `diff > 0`：刷 `last_screen_change_ms`——页签 🔄/✅ 只看它。
+///
+/// `resized` = 这次 diff 是**网格尺寸变了**凑出来的（见 [`diff_screen_cells`]）：
+/// 一个时间戳都不刷。resize 把整屏格子重排一遍，字符序列根本对不上，diff 必然
+/// 等于全屏格数；把它当成「屏幕变过」会让**每个**后台页签在窗口一改大小时集体
+/// 亮 🔄，然后挂满一个静默门槛（8s）才落回 ✅——用户看到的就是「页签状态跟实际
+/// 不一致」。静止的页签就是静止的，resize 不改变这一点。
 pub(crate) fn stamp_screen_activity(
     diff: usize,
     now_ms: u64,
     screen: &AtomicU64,
     content: &AtomicU64,
     output_count: &AtomicU32,
+    resized: bool,
 ) {
-    if diff == 0 {
+    if diff == 0 || resized {
         return;
     }
     screen.store(now_ms, Ordering::Relaxed);
@@ -765,6 +772,26 @@ pub(crate) fn stamp_screen_activity(
             output_count.store(1, Ordering::Relaxed);
         }
     }
+}
+
+/// 逐格比对两屏字符 → 变化的格数，并回报「这个 diff 是不是尺寸变了凑出来的」。
+///
+/// 尺寸变了（resize / 换页）时旧的那屏字符与新屏**逐位不可比**（行数/列数都不
+/// 同），旧实现直接按「整体变化」返回 `now_chars.len()`——全屏格数，必然 ≥
+/// [`MIN_CONTENT_CELLS`]。于是**每个**后台页签在窗口一 resize 时都被刷一次
+/// 「成规模内容刚到」：`last_screen_change_ms` 与 `last_content_ms` 同时刷新 →
+/// 页签集体亮 🔄 挂满 8s，而画面其实一个字都没多出来。
+///
+/// 返回 `(diff, resized)`：尺寸变了就报 `resized=true`，调用方据此一个时间戳都不刷
+/// （[`stamp_screen_activity`]）。
+pub(crate) fn diff_screen_cells(prev: &[char], now: &[char]) -> (usize, bool) {
+    if prev.len() != now.len() {
+        return (now.len(), true);
+    }
+    (
+        now.iter().zip(prev).filter(|(a, b)| a != b).count(),
+        false,
+    )
 }
 
 #[cfg(windows)]
@@ -1377,16 +1404,8 @@ crate::log_crash("reader-panic", &format!("VT 解析 panic（后台页签），�
                                         now_chars.extend(snap.cells.iter().map(|(_, c)| {
                                             if c.c == '\0' { ' ' } else { c.c }
                                         }));
-                                        let diff = if prev_screen.len() == now_chars.len() {
-                                            now_chars
-                                                .iter()
-                                                .zip(&prev_screen)
-                                                .filter(|(a, b)| a != b)
-                                                .count()
-                                        } else {
-                                            // 尺寸变了（resize / 换页）：整体按变化算。
-                                            now_chars.len()
-                                        };
+                                        let (diff, resized) =
+                                            diff_screen_cells(&prev_screen, &now_chars);
                                         std::mem::swap(&mut prev_screen, &mut now_chars);
                                         // 视口偏移变了 = 这一屏变化是滚出来的，不是
                                         // 新内容：不刷任何时间戳（图标/通知不跟着滚轮动）。
@@ -1400,6 +1419,7 @@ crate::log_crash("reader-panic", &format!("VT 解析 panic（后台页签），�
                                                 &reader_last_screen_change,
                                                 &reader_last_content,
                                                 &output_count,
+                                                resized,
                                             );
                                         }
                                     }
@@ -1425,16 +1445,8 @@ crate::log_crash("reader-panic", &format!("VT 解析 panic（后台页签），�
                                             }
                                             Some(if ix.cell.c == '\0' { ' ' } else { ix.cell.c })
                                         }));
-                                        let diff = if prev_screen.len() == now_chars.len() {
-                                            now_chars
-                                                .iter()
-                                                .zip(&prev_screen)
-                                                .filter(|(a, b)| a != b)
-                                                .count()
-                                        } else {
-                                            // 尺寸变了（resize / 换页）：整体按变化算。
-                                            now_chars.len()
-                                        };
+                                        let (diff, resized) =
+                                            diff_screen_cells(&prev_screen, &now_chars);
                                         std::mem::swap(&mut prev_screen, &mut now_chars);
                                         // 同上：滚出来的变化不算内容（offset_val 已经
                                         // 就是本块的视口偏移）。
@@ -1447,6 +1459,7 @@ crate::log_crash("reader-panic", &format!("VT 解析 panic（后台页签），�
                                                 &reader_last_screen_change,
                                                 &reader_last_content,
                                                 &output_count,
+                                                resized,
                                             );
                                         }
                                     }
@@ -1614,14 +1627,15 @@ use super::*;
     /// 屏幕变化 → 两个时间戳的记账约定（app.rs tab_icon 的输入源）。
     /// ① 零变化（整屏重画同样的字）：一个时间戳都不刷——「静止却常亮 🔄」的根因；
     /// ② 任意 ≥1 格变化：刷 last_screen_change_ms（页签 🔄/✅ 只看它）；
-    /// ③ ≥MIN_CONTENT_CELLS 格：另刷 content 并把 output_count 顶到 ≥1（通知侧门槛）。
+    /// ③ ≥MIN_CONTENT_CELLS 格：另刷 content 并把 output_count 顶到 ≥1（通知侧门槛）；
+    /// ④ resize 凑出来的整屏 diff：一个时间戳都不刷（见下一条测试）。
     #[test]
     fn stamp_screen_activity_semantics() {
         let screen = AtomicU64::new(0);
         let content = AtomicU64::new(0);
         let count = AtomicU32::new(0);
         let call = |diff: usize, t: u64| {
-            stamp_screen_activity(diff, t, &screen, &content, &count);
+            stamp_screen_activity(diff, t, &screen, &content, &count, false);
         };
 
         // ① 零变化：全都不动。
@@ -1642,6 +1656,40 @@ use super::*;
         assert_eq!(screen.load(Ordering::Relaxed), 4_000);
         assert_eq!(content.load(Ordering::Relaxed), 4_000);
         assert_eq!(count.load(Ordering::Relaxed), 1);
+    }
+
+    /// ④ resize 凑出来的整屏 diff **不是**「屏幕变过」（后台页签状态被带跑的
+    /// 主因）：格子重排后新旧字符序列逐位不可比，diff 必然等于全屏格数，把它算
+    /// 成内容会让每个后台页签在窗口一改大小时集体亮 🔄 挂满一个静默门槛。
+    #[test]
+    fn resize_diff_stamps_nothing() {
+        let screen = AtomicU64::new(0);
+        let content = AtomicU64::new(0);
+        let count = AtomicU32::new(0);
+        // 全屏格数级别的 diff + resized=true：一个时间戳都不许刷。
+        stamp_screen_activity(2_400, 9_000, &screen, &content, &count, true);
+        assert_eq!(
+            (screen.load(Ordering::Relaxed), content.load(Ordering::Relaxed)),
+            (0, 0),
+            "resize 不制造内容"
+        );
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+        // 同样的 diff 但来自真输出 → 照旧记账（别把这条修成「大变化也不算」）。
+        stamp_screen_activity(2_400, 9_000, &screen, &content, &count, false);
+        assert_eq!(screen.load(Ordering::Relaxed), 9_000);
+        assert_eq!(content.load(Ordering::Relaxed), 9_000);
+    }
+
+    /// `diff_screen_cells` 的两条口径：长度不同 = 尺寸变了（报 resized，diff 不
+    /// 该被当内容用）；长度相同 = 逐格比。
+    #[test]
+    fn diff_screen_cells_reports_resize() {
+        let prev: Vec<char> = "abc".chars().collect();
+        assert_eq!(diff_screen_cells(&prev, &"abd".chars().collect::<Vec<_>>()), (1, false));
+        assert_eq!(diff_screen_cells(&prev, &prev), (0, false));
+        // 长度变了：报 resized，diff 仍是格数（调用方据此不刷时间戳）。
+        let wider: Vec<char> = "abcdef".chars().collect();
+        assert_eq!(diff_screen_cells(&prev, &wider), (6, true));
     }
 
     /// 卡死回归（出现过多次）：VT 解析 panic 会带走整条 reader 线程 →

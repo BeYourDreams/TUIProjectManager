@@ -89,7 +89,19 @@ fn frame_delay_ms(interacting: bool, busy: bool) -> u64 {
 /// 换来这 5s 内继续亮 🔄。代价是真跑完的页签晚 5s 变 ✅（页签在跑态多挂 5s，
 /// 远好过谎报完成 + 误弹「任务完成」）。系统通知另有更严的 [`TOAST_QUIET_MS`]
 /// （10s），不受此值影响。
+///
+/// **已开放成设置**（`settings.done_quiet_ms`，设置页「🚦 页签状态」里拖）：
+/// 8s 只是默认值。它本质是「谎报完成」与「✅ 迟亮」之间的取舍，没有两头都好的
+/// 数——手上 agent 的静默节奏各机器不一样，所以交给用户调。本常量退化为默认值
+/// 与单测口径（判定函数一律按参数走，不读全局）。合法区间见 config.rs 的
+/// [`config::DONE_QUIET_MIN_MS`] / [`config::DONE_QUIET_MAX_MS`]。
+/// 生产路径已全走 `settings.done_quiet_ms`，只剩单测拿它当固定口径，故在非
+/// test 构建下放行死代码告警（与 `cmd_arg` 同理）。
+#[cfg_attr(not(test), allow(dead_code))]
 const DONE_QUIET_MS: u64 = 8_000;
+/// 设置页里这个滑杆的区间（秒）：1s（再小屏幕一动就 🔄、✅ 永不亮）到 5 分钟
+/// （再长就是拿不到完成信号，不是“延迟”了）。步进 0.5s。
+const DONE_QUIET_SLIDER_S: std::ops::RangeInclusive<f64> = 1.0..=300.0;
 /// 交互帧率窗口：键盘/IME/粘贴/点击转发写 `last_input_ms`、滚轮转发写
 /// `last_scroll_ms`（terminal.rs 统一记账），**只用来把整窗帧率拉到交互档**
 /// （见 [`frame_delay_ms`]）。页签状态判定不读这两个时间戳：回显与真输出同路。
@@ -3460,6 +3472,36 @@ fn state_due(
     last_change_ms > last_check_ms
 }
 
+/// 后台页签切回前台那一次的**状态对账**（纯记账，不做判定）。
+///
+/// 为什么必须这一步：后台页签的画面**不渲染**（terminal.rs 只在当前页签上跑
+/// show_terminal），reader 却照旧在跑：它走“不重建整屏格子”的分支
+/// （session.rs 读循环），照样逐块比对可见格、照样刷
+/// `last_screen_change_ms`。于是出现两条只有后台页签才有的错：
+///
+/// ① **陈旧**：后台页签那串时间戳是它在后台期间攒下的，切回前台时 UI 才第一次
+///   真正画出这一屏。若它最后变化发生在 8s 之前，切回的第一帧就已经过了门槛 ——
+///   用户明明刚看见画面（可能还在动），图标却直接给 ✅/空。
+/// ② **整屏假变化**：reader 的 `prev_screen` 是它自己逐块推进的，而前台那份快照
+///   在后台期间没重建（cells_stale）。切回那帧 UI 就地重建快照，reader 下一次
+///   比对用的是**另一条路的字符序列**；两者长度/内容对不上时 diff 被算成整屏
+///   变化（`prev_screen.len() != now_chars.len()` 的分支）→ 时间戳刷成“刚刚变过”
+///   → 静止的页签被判 🔄。窗口 resize 过（列数变了）时这条必中。
+///
+/// 记账的办法很土但够用：切回前台的那一刻（UI 就在这一帧重建快照）把
+/// `last_screen_change_ms` 顶到当前时刻，让「静默多久」从**切回这一刻**重新起算，
+/// ①②两头一起断掉——既不再拿后台攒下的陈旧时间戳直接判完成，也不再让两路
+/// 快照的口径差算出一次假的“刚变过”。代价是切回后最多多挂一个门槛期的 🔄
+/// （用户正盯着这个页签、画面就在眼前，这个方向的迟滞远比谎报完成可接受）。
+fn sync_screen_stamp(s: &crate::session::Session, now_ms: u64) {
+    resync_stamp(&s.last_screen_change_ms, now_ms);
+}
+
+/// [`sync_screen_stamp`] 的记账本体（拿原子做参数，便于单测）。
+fn resync_stamp(screen: &std::sync::atomic::AtomicU64, now_ms: u64) {
+    screen.store(now_ms, Ordering::Relaxed);
+}
+
 /// App 侧的快照刷新：把图标 + 完成态**一起**算进 Session 的原子里。
 ///
 /// 页签图标（tab_bar）与「任务完成」通知（update_done_states）都只读这份快照，
@@ -3497,10 +3539,26 @@ fn refresh_tab_state(s: &crate::session::Session, now_ms: u64, done_quiet_ms: u6
     s.state_done.store(code == ICON_DONE, Ordering::Relaxed);
 }
 
-/// 读快照出图标：退出/加载中即时纠正（事件驱动，不受 1s 门限约束）；
-/// 已查看则把 ✅ **立刻**抹掉（每帧直读 viewed，不等 1s 快照门限）——
-/// 用户刚操作过就不该还挂着「待查看」。
-fn tab_icon_from_snap(s: &crate::session::Session, viewed: bool) -> Option<&'static str> {
+/// 读快照出图标，再用**当前实际状态**纠正两条：
+/// ① 退出/加载中即时纠正（事件驱动，不受 1s 门限约束）；
+/// ② 已查看则把 ✅ **立刻**抹掉（每帧直读 viewed，不等 1s 快照门限）——
+///   用户刚操作过就不该还挂着「待查看」；
+/// ③ 「在跑 / 不在跑」按**此刻**的屏幕时间戳重判（[`live_icon_code`]）：
+///   快照是 1s 才重算一份的采样，屏幕在采样之后刚变过 → 快照还写着「空」而画面
+///   明明在动；反之屏幕已经停够门槛 → 快照还挂着 🔄。图标是给人看的，这两条
+///   迟滞一眼就能看见，所以渲染路径每帧按实时值纠正。
+///
+/// ✅ 会不会被这里“提前”点亮：不会。实时值走的是与快照**同一套判据**
+/// （`live_icon_code` 直接调 `tab_icon`），所以「停够门槛 → ✅」这一条两边算出来
+/// 必然一样，只是实时这边不用等下一个 1s 采样点。真正被改变的是两个方向上的
+/// 半拍迟滞：采样之后屏幕又变过（空 → 🔄）、采样之后又停够门槛（🔄 → ✅/空）。
+/// 「已查看」把 ✅ 抹成空这一条照旧（每帧直读 viewed）。
+fn tab_icon_from_snap(
+    s: &crate::session::Session,
+    viewed: bool,
+    now_ms: u64,
+    done_quiet_ms: u64,
+) -> Option<&'static str> {
     let snap = s.state_icon.load(Ordering::Relaxed);
     if snap & SNAP_EXITED != 0 {
         return Some("❌");
@@ -3508,11 +3566,41 @@ fn tab_icon_from_snap(s: &crate::session::Session, viewed: bool) -> Option<&'sta
     if snap & SNAP_LOADING != 0 {
         return Some("🔄");
     }
-    let code = snap & SNAP_CODE_MASK;
+    // 实时判据：与 refresh_tab_state 同一套输入（取两个屏幕时间戳的最新者）。
+    let code = live_icon_code(s, now_ms, done_quiet_ms).unwrap_or(snap & SNAP_CODE_MASK);
     if viewed && code == ICON_DONE {
         return None;
     }
     icon_from_code(code)
+}
+
+/// 「此刻」该是什么图标码：按实时的屏幕时间戳跑一遍 [`tab_icon`]（纯函数，
+/// 与 1s 快照用的判据完全一致）。返回 None = 此刻用不上实时值（未跑/加载中/
+/// 已退出），沿用快照。
+///
+/// 为什么只看它、不看别的：`tab_icon` 的 ✅ 分支同样过静默门槛，所以「屏幕已经
+/// 停够门槛而快照还挂 🔄」也会被这里纠正成 ✅——但这与快照算出的结果必然相同
+/// （同判据同输入），真正会被改变的是**时间戳在采样之后又推进过**的那半拍。
+fn live_icon_code(s: &crate::session::Session, now_ms: u64, done_quiet_ms: u64) -> Option<u8> {
+    if s.exited.load(Ordering::Acquire) {
+        return None; // 退出归快照的即时纠正路径（❌）
+    }
+    if s.loading_active(now_ms) {
+        return None; // 加载中同理（🔄）
+    }
+    let last_change = s
+        .last_content_ms
+        .load(Ordering::Relaxed)
+        .max(s.last_screen_change_ms.load(Ordering::Relaxed));
+    Some(icon_code(tab_icon(
+        false,
+        false,
+        s.output_count.load(Ordering::Relaxed),
+        s.has_been_viewed.load(Ordering::Relaxed),
+        last_change,
+        now_ms,
+        done_quiet_ms,
+    )))
 }
 
 /// Tab 的轻量投影（Tab 持有 Session，坐标换算只需这四类）。
@@ -5196,7 +5284,12 @@ pad: tab_margin.left as f32 + tab_margin.right as f32,
                     // 状态快照：最快 1s 重算一次（STATE_CHECK_MS），退出/加载/
                     // 新实质内容这三类事件不等门限（见 state_due）。
 refresh_tab_state(s, now_ms, self.config.settings.done_quiet_ms);
-let icon = tab_icon_from_snap(s, s.has_been_viewed.load(Ordering::Relaxed));
+let icon = tab_icon_from_snap(
+                        s,
+                        s.has_been_viewed.load(Ordering::Relaxed),
+                        now_ms,
+                        self.config.settings.done_quiet_ms,
+                    );
                     let title = s.title.clone();
                     let selected = self.current == i;
                     let dir_key = s.dir.as_str();
@@ -6227,6 +6320,9 @@ match self.config.settings.project_sort {
         self.notify_section_ui(ui);
         ui.separator();
         ui.add_space(6.0);
+        self.tab_state_section_ui(ui);
+        ui.separator();
+        ui.add_space(6.0);
         // 帧率设置已整体移除（曾可调 30 FPS）：持续高帧率重绘会干扰 Windows
         // 悬停激活窗口（焦点随鼠标）——30 FPS 输出中实测失效、10 FPS 正常（见
         // 921f062/0ae5904）。根治 = 去掉可调档，锁死 10 FPS（BUSY_FRAME_MS）。
@@ -6272,6 +6368,56 @@ ui.add_space(12.0);
             self.config.settings.notify_toast = toast;
             self.config.settings.notify_flash = flash;
             self.save_config("提醒设置已保存".to_string());
+        }
+    }
+
+    /// 设置页的「页签状态」区：✅ 判完成的**延迟静默门槛**（`done_quiet_ms`）。
+    ///
+    /// 这个数就是 README 里那条固有边界的旋钮：屏幕启发式分不清「回合中途的
+    /// 静默」与「真跑完了」，只能整体后延一段时间才判完成。调大 → 少谎报完成
+    /// 但 ✅ 更晚亮；调小 → ✅ 更快亮但更易误判。没有两头都好的值，所以开放成
+    /// 设置，按自己手上 agent 的节奏调。
+    fn tab_state_section_ui(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("🚦 页签状态").strong());
+        let mut secs = self.config.settings.done_quiet_ms as f64 / 1000.0;
+        let resp = ui
+            .add(
+                egui::Slider::new(&mut secs, DONE_QUIET_SLIDER_S)
+                    .step_by(0.5)
+                    .suffix(" 秒")
+                    .text("判完成延迟")
+                    .show_value(true),
+            )
+            .on_hover_text(
+                "屏幕（任一可见格）静止满这个时长才判「跑完了」、页签才亮 ✅。\
+                 调大：更少谎报完成，但 ✅ 晚亮；调小：✅ 早亮，但回合中途的静默\
+                 （等首个 token / 跑一条不出字的命令）会被误判成完成。",
+            );
+        ui.label(
+            RichText::new(
+                "屏幕（任一可见格）静止满这个时长且期间一格都没变，页签才亮 ✅；在此之前一律 \
+                 🔄（含进度条每跳只改 1~3 格）。「任务完成」的系统通知另有更严的 10s 静默门槛，\
+                 不随这里变。",
+            )
+            .weak()
+            .small(),
+        );
+        if !resp.changed() {
+            return;
+        }
+        // 秒 → 毫秒：步进 0.5s，换算后仍是整数毫秒（500 的倍数）。夹一次是兜
+        // 住手改 config.json 留下的出界值（滑杆自己不会越界）。
+        let ms = config::clamp_done_quiet_ms((secs * 1000.0).round() as u64);
+        if ms == self.config.settings.done_quiet_ms {
+            return;
+        }
+        // 新值**立刻生效**（页签状态机每帧读 settings），但**只在松手时落盘**：
+        // 拖着滑杆走会每帧 changed()，逐帧 save_config 就是逐帧写一份
+        // config.json（tmp + fsync + rename）。
+        self.config.settings.done_quiet_ms = ms;
+        let released = ui.input(|i| i.pointer.any_released());
+        if released || !resp.dragged() {
+            self.save_config(format!("页签状态已保存：判完成延迟 {:.1} 秒", ms as f64 / 1000.0));
         }
     }
 
@@ -8245,12 +8391,23 @@ impl eframe::App for ClientApp {
         // 这两处：终端内的打字/滚轮/点击**不算**——回显与真输出同路，状态只该看输出。
         // 没交互过就一直算「未查看」→ 激活页签跑完照样亮 ✅；新一轮输出会复位
         // viewed（session.rs 读循环），下一轮跑完再亮。
+        let now_ms = crate::now_ms();
         for (i, t) in self.tabs.iter().enumerate() {
             if let Tab::Session(s) = t {
                 // foreground 只管「是不是当前页签」（update_exited 用它决定退出
                 // 判定的频率），**不**跟着 app_fg 走：改它会让失焦时退出回收退到
                 // 低频轮询，与本需求无关。
-                s.foreground.store(i == self.current, Ordering::Relaxed);
+                let fg = i == self.current;
+                // ── 后台 → 前台的那一次：状态对账 ──
+                // 后台页签不渲染但 reader 照跑（时间戳照刷），前台那份快照也没
+                // 重建（cells_stale）。切回这一刻让「静默多久」重新起算（见
+                // sync_screen_stamp）：状态从用户此刻真正看到的画面开始判。
+                // swap 取旧值 = 只在**跃迁**那一次记账，前台每帧反复写不会
+                // 把静默计时一直摁在 0（那样 🔄 永驻、✅ 永不亮）。
+                let was_fg = s.foreground.swap(fg, Ordering::Relaxed);
+                if fg && !was_fg {
+                    sync_screen_stamp(s, now_ms);
+                }
             }
         }
 
@@ -8818,9 +8975,10 @@ if self.spawning.is_empty() && !self.restore_slots.is_empty() {
 #[cfg(test)]
 mod tab_icon_tests {
     use super::{
-        state_due, tab_icon, toast_quiet_enough, DONE_QUIET_MS, ICON_EMPTY, SNAP_EXITED,
-        STATE_CHECK_MS, TOAST_QUIET_MS,
+        icon_code, resync_stamp, state_due, tab_icon, toast_quiet_enough, DONE_QUIET_MS,
+        ICON_BUSY, ICON_DONE, ICON_EMPTY, SNAP_EXITED, STATE_CHECK_MS, TOAST_QUIET_MS,
     };
+    use std::sync::atomic::Ordering;
 
     /// 只喂「屏幕最后一次变化距今多久」+「是否已查看」。
     fn icon(count: u32, viewed: bool, silent_ms: u64) -> Option<&'static str> {
@@ -8926,6 +9084,76 @@ assert_eq!(tab_icon(false, false, 10, false, 0, 100_000, DONE_QUIET_MS), None);
     #[test]
     fn never_output_session_never_toasts() {
         assert!(!toast_quiet_enough(0, 100_000));
+    }
+
+    /// 渲染路径的**实时纠正**（用户反馈「页签状态跟实际不一致」）：图标码是
+    /// STATE_CHECK_MS=1s 才重算一份的采样，采样之后屏幕又变过/又停够门槛的那
+    /// 半拍，快照是陈的。`live_icon_code` 按此刻的时间戳重跑同一套判据。
+    /// 这是纯函数层面对照：直接按 icon_code(tab_icon(..)) 语义钉住。
+    #[test]
+    fn live_code_follows_the_screen_not_the_snapshot() {
+        let now = 100_000u64;
+        let code = |silent_ms: u64, viewed: bool| {
+            icon_code(tab_icon(
+                false,
+                false,
+                10,
+                viewed,
+                now - silent_ms,
+                now,
+                DONE_QUIET_MS,
+            ))
+        };
+        // 采样之后刚变过（静默 100ms）→ 🔄，哪怕快照那一份还写着空/✅。
+        assert_eq!(code(100, false), ICON_BUSY);
+        // 采样之后停够门槛 → ✅（未查看）/ 空（已查看）。
+        assert_eq!(code(DONE_QUIET_MS, false), ICON_DONE);
+        assert_eq!(code(DONE_QUIET_MS, true), ICON_EMPTY);
+        // 门槛差 1ms 都不放行：🚦 与 ✅ 的边界必须与快照那份完全一致
+        // （同判据同输入，两个消费者不许各判各的）。
+        assert_eq!(code(DONE_QUIET_MS - 1, false), ICON_BUSY);
+    }
+
+    /// 后台 → 前台那一次的状态对账：切回时把屏幕时间戳顶到当前时刻，于是
+    /// 「静默多久」从切回这一刻重新起算，而不是接着后台攒下的陈旧时间戳算。
+    /// 不做的话，后台页签攒下的时间戳要么让 ✅ 早亮（陈旧），要么被两路快照
+    /// 口径差算成「刚变过」而常驻 🔄。
+    #[test]
+    fn sync_screen_stamp_restarts_the_silence_timer() {
+        // 纯记账函数：把此刻写进 last_screen_change_ms。
+        let screen = std::sync::atomic::AtomicU64::new(1_000);
+        resync_stamp(&screen, 50_000);
+        assert_eq!(screen.load(Ordering::Relaxed), 50_000);
+        // 归零重算的直接结果：刚切回时不判完成（🔄），而不是拿 1_000 那个
+        // 陈旧时间戳算出「已静默 49s → ✅」。
+        let now = 50_000u64;
+        assert_eq!(
+            icon_code(tab_icon(
+                false,
+                false,
+                10,
+                false,
+                screen.load(Ordering::Relaxed),
+                now,
+                DONE_QUIET_MS,
+            )),
+            ICON_BUSY,
+            "刚切回前台的页签按实际画面判：先看一眼再下结论"
+        );
+        // 对照：不对账（沿用陈旧时间戳）就是「谎报完成」这条老毛病。
+        assert_eq!(
+            icon_code(tab_icon(
+                false,
+                false,
+                10,
+                false,
+                1_000,
+                now,
+                DONE_QUIET_MS,
+            )),
+            ICON_DONE,
+            "不对账就会拿后台攒下的陈旧时间戳直接判完成"
+        );
     }
 
     /// 采样快照回归（用户反馈「后台页签明明在跑，状态却经常变空」）：图标读的是

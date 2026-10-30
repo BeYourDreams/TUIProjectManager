@@ -89,9 +89,22 @@ fn default_done_quiet_ms() -> u64 {
     8_000
 }
 
+/// 页签「✅ 判完成」的静默门槛的合法区间（毫秒）。
+///
+/// 下界 1s：低于 1s 时屏幕任何一格的变化都会被立刻当成“在跑”，而命令输出
+/// 的块间静默（PTY 一块读、TUI 重绘间隔）轻易就超过 1s → 🔄 常驻、✅ 几乎
+/// 永不亮。上界 5 分钟：再长就不是“延迟”，而是用户根本拿不到完成信号。
+pub const DONE_QUIET_MIN_MS: u64 = 1_000;
+pub const DONE_QUIET_MAX_MS: u64 = 300_000;
+
+/// 把配置里（或手改过的）静默门槛夹回合法区间：越界值不报错、直接夹住。
+/// 手改 config.json 写成 0 / 999999 时要么 ✅ 永不亮、要么迟得没法用，
+/// 夹住比让整份配置解析失败或状态机失控都好。
+pub fn clamp_done_quiet_ms(v: u64) -> u64 {
+    v.clamp(DONE_QUIET_MIN_MS, DONE_QUIET_MAX_MS)
+}
 
 
-/// TUI 启动命令的**等价键**：去首尾空白与引号 → 只取命令本身（忽略参数）
 /// → 取路径末段文件名 → 去 `.exe` 后缀（不区分大小写）→ 折叠空白 → 小写。
 /// 于是 `nvim`、`NVIM`、`nvim.exe`、`D:\Tools\nvim.EXE`、`"nvim"` 视为同一条，
 /// 添加 / 改名时用它比对，不会把同一条命令重复塞进列表。
@@ -152,7 +165,9 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub notify_flash: bool,
 
-    /// 延迟静默门槛（毫秒）：屏幕任一可见格不变满此时间后才判完成，✅ 图标才会亮起。
+    /// 页签「判完成」的延迟静默门槛（毫秒）：屏幕**任一可见格**不变满此时长
+    /// 才判完成、✅ 才亮起。可在设置页调（[`DONE_QUIET_MIN_MS`]..=[`DONE_QUIET_MAX_MS`]）。
+    /// 调大 = 少谎报完成、✅ 更晚亮；调小 = ✅ 更快亮、更易误判。
     #[serde(default = "default_done_quiet_ms")]
     pub done_quiet_ms: u64,
 }
@@ -273,6 +288,7 @@ pub fn load_from(dir: &std::path::Path) -> Config {
         },
         Err(_) => Config::default(),
     };
+    sanitize_settings(&mut config.settings);
     // 旧版本只有 tui_command，迁移到 tui_commands 列表。
     if config.settings.tui_commands.is_empty() {
         let cmd = config.settings.tui_command.trim().to_string();
@@ -282,6 +298,13 @@ pub fn load_from(dir: &std::path::Path) -> Config {
     }
     normalize_tui_commands(&mut config.settings);
     config
+}
+
+/// 把越界的数值型设置夹回合法区间：手改 config.json / 老版本写下的值都可能
+/// 出界（`done_quiet_ms: 0` 会让 ✅ 永不亮），逐项夹住而不是让状态机拿到
+/// 一个语义上不存在的数。
+fn sanitize_settings(s: &mut Settings) {
+    s.done_quiet_ms = clamp_done_quiet_ms(s.done_quiet_ms);
 }
 
 /// 启动命令列表去重（按 tui_command_key 等价判重，保留首次出现的写法）：
@@ -912,6 +935,34 @@ assert_eq!(d.base_url, "http://localhost:20128/v1");
         assert!(!back.notify_toast && back.notify_flash);
         let old: Settings = serde_json::from_str(r#"{"tui_commands":["nvim"]}"#).unwrap();
         assert!(old.notify_toast && old.notify_flash);
+    }
+
+    /// 「✅ 判完成」的静默门槛：默认 8s；旧配置没这字段时也得是 8s（否则老用户
+    /// 升级后门槛变成 0，屏幕一动就 🔄、✅ 永不亮）。手改出界的值夹回区间。
+    #[test]
+    fn done_quiet_ms_default_and_clamped() {
+        assert_eq!(Settings::default().done_quiet_ms, default_done_quiet_ms());
+        let old: Settings = serde_json::from_str(r#"{"tui_commands":["nvim"]}"#).unwrap();
+        assert_eq!(old.done_quiet_ms, default_done_quiet_ms());
+        let json = serde_json::to_string(&Settings::default()).unwrap();
+        assert!(json.contains("done_quiet_ms"), "要落盘才能在设置页调: {json}");
+
+        // 区间两端与越界值：0 → 下界（0 会让 ✅ 永不亮），超大 → 上界。
+        assert_eq!(clamp_done_quiet_ms(0), DONE_QUIET_MIN_MS);
+        assert_eq!(clamp_done_quiet_ms(DONE_QUIET_MIN_MS - 1), DONE_QUIET_MIN_MS);
+        assert_eq!(clamp_done_quiet_ms(5_000), 5_000);
+        assert_eq!(clamp_done_quiet_ms(DONE_QUIET_MAX_MS), DONE_QUIET_MAX_MS);
+        assert_eq!(clamp_done_quiet_ms(DONE_QUIET_MAX_MS + 1), DONE_QUIET_MAX_MS);
+        assert_eq!(clamp_done_quiet_ms(u64::MAX), DONE_QUIET_MAX_MS);
+
+        // 加载路径也要夹（手改 config.json 是真实场景）。
+        let dir = tmp_dir("done_quiet");
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"settings":{"done_quiet_ms":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(load_from(&dir).settings.done_quiet_ms, DONE_QUIET_MIN_MS);
     }
 
     /// 每个测试一份独立临时目录
