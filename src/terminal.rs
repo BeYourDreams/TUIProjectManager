@@ -27,6 +27,11 @@ pub const TERM_FONT_SIZE: f32 = 14.0;
 const TERM_BG_DARK: Color32 = Color32::from_rgb(22, 22, 26);
 const TERM_BG_LIGHT: Color32 = Color32::WHITE;
 
+/// 浅色主题下"暗色底色"偏转阈值（亮度）：
+/// 暗于中灰分界（0.55）的底色全部偏转至白底，
+/// 保证深色文字站在亮底上（解决"深色字体 + 深色背景"不可读）。
+const LIGHT_BG_MIN_LUM: f32 = 0.55;
+
 fn color_for(dark: bool, dark_c: Color32, light_c: Color32) -> Color32 {
     if dark { dark_c } else { light_c }
 }
@@ -89,46 +94,41 @@ fn perf_report(f: PerfFrame, frame_us: u64) {
 
 
 
-/// 浅色主题下把暗色主题 TUI 的配色映射为可读组合：
-/// 深背景 → 白；亮灰/白前景 → 黑；过亮的饱和前景（亮黄、亮青、亮绿、亮紫…）
-/// 在白底上对比不足，按通道等比压暗（保留色相）到半亮度保证可读。
+/// 浅色主题下控制台色值的统一偏转映射（暗底深字原则：深色文字必须落在亮底上）：
+/// - 文字（fg）全部压暗：亮且中性的直接碾成深黑，其他（暗色/饱和色）等比压暗一半；
+///   保留色相；
+/// - 底色（bg）全部偏转：亮度 0.55 以下的暗底统一贴白底。
+/// 原色终端是黑底白字 —— 调色盘全是为暗底配的，到亮底上不做统一偏转，
+/// 就会出现“暗字 + 暗底”的不可读态（字底同深）。
 fn adapt_to_light(fg: Color32, bg: Color32) -> (Color32, Color32) {
     (adapt_fg_light(fg), adapt_bg_light(bg))
 }
 
 /// 浅色主题下的前景调整（与背景无关，见 adapt_to_dark 的同构注释）。
+/// 所有字色统一压暗半步（纯整数通道移位：快，无乘除法）：
+///   亮且中性（如 #FFFFFF / #F0F0F0）：直接碾成纯黑，黑字落在白底上对比够了；
+///   其他（暗色如 #008000、饱和色 如 #FFFF00）：通道等比压暗一半，比如
+///   #FFFF00 -> #7F7F00，#008000 -> #004000 —— 暗色在亮底上也要暗下去。
 fn adapt_fg_light(c: Color32) -> Color32 {
-    let lum = |c: Color32| {
-        0.2126 * c.r() as f32 / 255.0
-            + 0.7152 * c.g() as f32 / 255.0
-            + 0.0722 * c.b() as f32 / 255.0
-    };
-    let neutral = |c: Color32| {
-        let max = c.r().max(c.g()).max(c.b()) as f32;
-        let min = c.r().min(c.g()).min(c.b()) as f32;
-        max - min < 32.0
-    };
-    let fl = lum(c);
-    if fl > 0.72 && neutral(c) {
-        Color32::BLACK
-    } else if fl > 0.55 {
-        // 亮饱和色（如 ANSI 亮黄 #FFFF00）白底上几乎看不见，压到半亮度：
-        // 色相不变，对比足够，且不会被误打成黑色。
-        Color32::from_rgb(
-            (c.r() as f32 * 0.5) as u8,
-            (c.g() as f32 * 0.5) as u8,
-            (c.b() as f32 * 0.5) as u8,
-        )
-    } else {
-        c
+    let r = c.r() as u32;
+    let g = c.g() as u32;
+    let b = c.b() as u32;
+    // 0.55 x 3 x 255 = 420.75 -> 整条 0..765 通道分界（就是个 luma x 3）；
+    // 中灰（~#808080 = 382）以下全部走“压暗一半”路线。
+    if r + g + b > 420 && r.max(g).max(b) - r.min(g).min(b) < 32 {
+        // 亮且中性 -> 纯黑（白底上的死黑最对比）
+        return Color32::BLACK;
     }
+    // 其他一切（暗色、饱和色）等比压暗一半：保留色相、字深到底。
+    Color32::from_rgb((r >> 1) as u8, (g >> 1) as u8, (b >> 1) as u8)
 }
 
-/// 浅色主题下的背景调整：过暗的底色提亮为白底。
+/// 浅色主题下的背景调整：**暗色底色统一偏转至白底**（过暗的底色全部贴白底），
+/// 注意：暗底色全部偏到白底，别留 `#555555` 级中灰底配上 `#444444` 深字不可读。
 fn adapt_bg_light(c: Color32) -> Color32 {
     let lum =
         0.2126 * c.r() as f32 / 255.0 + 0.7152 * c.g() as f32 / 255.0 + 0.0722 * c.b() as f32 / 255.0;
-    if lum < 0.30 { TERM_BG_LIGHT } else { c }
+    if lum < LIGHT_BG_MIN_LUM { TERM_BG_LIGHT } else { c }
 }
 
 /// 索引色 → 256 项 RGB 查表（来自 OSC 主题色；未设置的索引为 TRANSPARENT，
@@ -2300,14 +2300,58 @@ fn light_adapt_keeps_bright_colors_readable() {
     let (f2, _) = adapt_to_light(Color32::WHITE, Color32::from_rgb(30, 30, 30));
     assert_eq!(f2, Color32::BLACK);
 
-    // 中亮度绿（如 0,128,0）白底对比已够，不得被改动。
+    // 亮绿（0,128,0）属暗色字：统一偏转后压暗一半（0,64,0），字深下去了对比才够白底。
     let green = Color32::from_rgb(0, 128, 0);
     let (f3, _) = adapt_to_light(green, Color32::from_rgb(30, 30, 30));
-    assert_eq!(f3, green);
+    assert_eq!(f3, Color32::from_rgb(0, 64, 0), "暗绿必须压暗，当前 {f3:?}");
 
-    // 深背景仍映射为白。
-    let (_, b) = adapt_to_light(yellow, Color32::BLACK);
-    assert_eq!(b, TERM_BG_LIGHT);
+    // 暗背景（黑、暗灰、中间度）仍映射为白
+    for dark_bk in [Color32::BLACK, Color32::from_rgb(0x33, 0x33, 0x33),
+                     Color32::from_rgb(0x55, 0x55, 0x55), Color32::from_rgb(0x00, 0x00, 0x20)]
+    {
+        let (_, b) = adapt_to_light(Color32::from_rgb(0x11, 0x11, 0x11), dark_bk);
+        assert_eq!(b, TERM_BG_LIGHT, "暗底 {dark_bk:?} 必须偏到白底");
+    }
+    // 亮背景（中灰以上）原样保留——它本就是浅面。
+    let (_, b) = adapt_to_light(Color32::from_rgb(0x11, 0x11, 0x11), Color32::from_rgb(0xB0, 0xB0, 0xB0));
+    assert_eq!(b, Color32::from_rgb(0xB0, 0xB0, 0xB0));
+
+    // 暗字（0,64,0、0x555555）压暗后也该暗得下去
+    let (g1, _) = adapt_to_light(Color32::from_rgb(0, 128, 0), Color32::BLACK);
+    assert_eq!(g1, Color32::from_rgb(0, 64, 0));
+    let (g2, _) = adapt_to_light(Color32::from_rgb(0x55, 0x55, 0x55), Color32::BLACK);
+    assert_eq!(g2, Color32::from_rgb(0x2a, 0x2a, 0x2a));
+    let (g3, _) = adapt_to_light(Color32::from_rgb(0xff, 0x55, 0x55), Color32::BLACK);
+    assert_eq!(g3, Color32::from_rgb(0x7f, 0x2a, 0x2a));
+}
+
+/// 浅色主题下暗字+暗底的裂缝：暗灰底（#555555，亮度 ≈ 0.33）配上
+/// 它包着的暗字（#444444），旧阈值 0.30 不去抬暗底，字底同深、字形看不清。
+/// 偏转规则必须把字底拆开：暗底统一贴白底，暗字留在白底上（暗字不得偏亮）。
+#[cfg(test)]
+#[test]
+fn light_theme_dark_text_on_dark_bg() {
+    // 控制台典型的暗色系前后景：暗灰/暗红/暗蓝/暗绿配同深度或更暗的底色。
+    let cases = [
+        (Color32::from_rgb(0x44, 0x44, 0x44), Color32::from_rgb(0x55, 0x55, 0x55)),
+        (Color32::from_rgb(0x33, 0x11, 0x11), Color32::from_rgb(0x22, 0x11, 0x11)),
+        (Color32::from_rgb(0x22, 0x22, 0x88), Color32::from_rgb(0x11, 0x11, 0x44)),
+        (Color32::from_rgb(0x00, 0x80, 0x00), Color32::from_rgb(0x00, 0x40, 0x00)),
+    ];
+    let lum = |c: Color32| {
+        0.2126 * c.r() as f32 / 255.0 + 0.7152 * c.g() as f32 / 255.0 + 0.0722 * c.b() as f32 / 255.0
+    };
+    for (fg, bg) in cases {
+        let (f, b) = adapt_to_light(fg, bg);
+        // 暗字必须留在暗边（偏亮会融着白底），暗底必须全量贴白底。
+        assert!(lum(f) <= 0.55, "暗字 {fg:?} 不得偏亮，当前 {f:?}");
+        assert!(lum(b) > 0.55, "暗底 {bg:?} 必须偏到白底，当前 {b:?}");
+    }
+    // 最终约定：不可能再出现 "暗字 + 暗底" 的不可读态。
+    for (fg, bg) in cases {
+        let (f, b) = adapt_to_light(fg, bg);
+        assert!(f != b, "字底同深（{fg:?} {bg:?}）应拆开，当前 {f:?} vs {b:?}");
+    }
 }
 
 /// 深色主题：过暗前景在深底提亮到可读（色相比不变）；过亮中性前景归白。
@@ -2394,6 +2438,12 @@ let term = Arc::new(RwLock::new(Term::new(
         let light = index_luts(&ansi, false);
         assert_ne!(dark.1[0], light.1[0], "bg 适配必须随主题变");
         assert_ne!(dark.0[1], light.0[1], "fg 适配必须随主题变");
+        // 中灰暗底：`#555555` 级暗底全部偏转至白底。
+        ansi[2] = Color32::from_rgb(0x55, 0x55, 0x55);
+        ansi[3] = Color32::from_rgb(0x44, 0x44, 0x44);
+        let light = index_luts(&ansi, false);
+        assert_eq!(light.1[2], TERM_BG_LIGHT, "dark gray bg must shift to white");
+        assert_eq!(light.0[3], Color32::from_rgb(0x22, 0x22, 0x22), "暗字 #444444 压暗一半到 #222222");
     }
 
     /// 帧级 LUT 建立在「fg 适配与 bg 无关」上：不成立的话逐格查表会和原
