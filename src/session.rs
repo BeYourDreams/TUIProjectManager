@@ -785,6 +785,9 @@ pub(crate) fn stamp_screen_activity(
 /// 返回 `(diff, resized)`：尺寸变了就报 `resized=true`，调用方据此一个时间戳都不刷
 /// （[`stamp_screen_activity`]）。
 pub(crate) fn diff_screen_cells(prev: &[char], now: &[char]) -> (usize, bool) {
+    if prev.is_empty() && !now.is_empty() {
+        return (now.len(), false);
+    }
     if prev.len() != now.len() {
         return (now.len(), true);
     }
@@ -1071,10 +1074,6 @@ let mut last_chunk_ms: u64 = 0;
             let mut prev_screen: Vec<char> = Vec::new();
             // 上一次「画面变化事件」的时刻（stamp_screen_activity 用）：判
             // 「画面是否在连续快速动」，同一次重绘的相邻块按合并窗折叠。
-            // 上一次的快照视口偏移（scrollback 行数）：滚轮只改视口，滚出来的
-            // 可见格变化不是新内容，不得刷新内容/画面时间戳（否则滚一下页签就
-            // 🔄 3s、✅ 被推后 8s——用户反馈「滚轮改写页签状态」）。
-            let mut prev_offset: usize = 0;
             // 跨块拼接缓冲：OMP 等程序的终端查询序列可能被 read() 切分到相邻块，
             // reply_to_queries 逐块扫描会漏掉。保留尾部未完成的转义序列，
             // 下一块拼接后重扫。
@@ -1364,10 +1363,14 @@ crate::log_crash("reader-panic", &format!("VT 解析 panic（后台页签），�
                             }
                         }
                         // ── 处理 UI 命令（滚动/调整大小/选区）──
+                        let mut user_scrolled = false;
                         while let Ok(cmd) = reader_cmd_rx.try_recv() {
                             let mut t = wlock(term.write());
                             match cmd {
-                                TermCommand::Scroll(s) => t.scroll_display(s),
+                                TermCommand::Scroll(s) => {
+                                    user_scrolled = true;
+                                    t.scroll_display(s)
+                                }
                                 TermCommand::Resize { cols, rows } => {
                                     t.resize(TermSize::new(cols, rows));
                                 }
@@ -1409,9 +1412,8 @@ crate::log_crash("reader-panic", &format!("VT 解析 panic（后台页签），�
                                         std::mem::swap(&mut prev_screen, &mut now_chars);
                                         // 视口偏移变了 = 这一屏变化是滚出来的，不是
                                         // 新内容：不刷任何时间戳（图标/通知不跟着滚轮动）。
-                                        let offset = t.grid().display_offset();
-                                        let scrolled = offset != prev_offset;
-                                        prev_offset = offset;
+                                        // 输出自己推动视口不算「用户滚动」；只有用户主动滚动才跳过。
+                                        let scrolled = user_scrolled;
                                         if !scrolled {
                                             stamp_screen_activity(
                                                 diff,
@@ -1421,6 +1423,14 @@ crate::log_crash("reader-panic", &format!("VT 解析 panic（后台页签），�
                                                 &output_count,
                                                 resized,
                                             );
+                                            // 本轮屏幕真的变了 → 这一轮输出用户还没看过：
+                                            // 重置「已查看」，让任务跑完后能亮 ✅（含动画/进度类输出）。
+                                            if !reader_loading.load(Ordering::Relaxed)
+                                                && diff > 0
+                                                && !resized
+                                            {
+                                                reader_viewed.store(false, Ordering::Relaxed);
+                                            }
                                         }
                                     }
                                     published_once = true;
@@ -1450,8 +1460,8 @@ crate::log_crash("reader-panic", &format!("VT 解析 panic（后台页签），�
                                         std::mem::swap(&mut prev_screen, &mut now_chars);
                                         // 同上：滚出来的变化不算内容（offset_val 已经
                                         // 就是本块的视口偏移）。
-                                        let scrolled = offset_val != prev_offset;
-                                        prev_offset = offset_val;
+                                        // 同上：只有用户主动滚动才算「滚出来的变化」。
+                                        let scrolled = user_scrolled;
                                         if !scrolled {
                                             stamp_screen_activity(
                                                 diff,
@@ -1461,6 +1471,12 @@ crate::log_crash("reader-panic", &format!("VT 解析 panic（后台页签），�
                                                 &output_count,
                                                 resized,
                                             );
+                                            if !reader_loading.load(Ordering::Relaxed)
+                                                && diff > 0
+                                                && !resized
+                                            {
+                                                reader_viewed.store(false, Ordering::Relaxed);
+                                            }
                                         }
                                     }
                                     reader_cells_stale.store(true, Ordering::Relaxed);
@@ -1690,6 +1706,10 @@ use super::*;
         // 长度变了：报 resized，diff 仍是格数（调用方据此不刷时间戳）。
         let wider: Vec<char> = "abcdef".chars().collect();
         assert_eq!(diff_screen_cells(&prev, &wider), (6, true));
+        // 首块（prev 为空）：不是 resize，是「整屏新内容」——否则新页签/恢复
+        // 页签的首块输出一个时间戳都不刷，起手就被判成 ✅/空。
+        assert_eq!(diff_screen_cells(&[], &wider), (6, false));
+        assert_eq!(diff_screen_cells(&[], &[]), (0, false));
     }
 
     /// 卡死回归（出现过多次）：VT 解析 panic 会带走整条 reader 线程 →
