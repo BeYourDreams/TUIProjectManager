@@ -682,10 +682,10 @@ fn ps_fetch_body(url: &str, timeout_secs: u64) -> Result<String, String> {
 }
 
 /// 本软件自身的 GitHub 仓库（检查自身更新用）。
-const SELF_REPO: &str = "qq458249269/TUIProjectManager";
+const SELF_REPO: &str = "BeYourDreams/TUIProjectManager";
 
 /// 本软件自身 Release 的页面前缀（资产片段 / 标签页 URL 拼在这里）。
-const SELF_REPO_PAGE: &str = "https://github.com/qq458249269/TUIProjectManager";
+const SELF_REPO_PAGE: &str = "https://github.com/BeYourDreams/TUIProjectManager";
 
 /// 探查源的**正文形态**：既决定「怎么把正文取回来」，也决定「正文里挖什么」。
 ///
@@ -1051,7 +1051,7 @@ fn download_update(
     // 限流/被墙（curl HTTP 22）时此失败不再最先发生、不打头进错误汇总。
     if exe_info.is_none() {
         let api_url = format!(
-            "https://api.github.com/repos/qq458249269/TUIProjectManager/releases/tags/{tag}"
+            "https://api.github.com/repos/BeYourDreams/TUIProjectManager/releases/tags/{tag}"
         );
         let mut api_cmd = std::process::Command::new(curl_bin());
         api_cmd.args([
@@ -1118,7 +1118,7 @@ fn download_update(
                 .map(|f| {
                     (
                         format!(
-                            "https://github.com/qq458249269/TUIProjectManager/releases/download/{tag}/{f}"
+                            "https://github.com/BeYourDreams/TUIProjectManager/releases/download/{tag}/{f}"
                         ),
                         f.to_string(),
                     )
@@ -9954,15 +9954,15 @@ mod update_tests {
 
     #[test]
     fn html_exe_extracted() {
-        let html = r#"<a href="/qq458249269/TUIProjectManager/releases/download/v2025.06.30.0001/TUIProjectManager.exe">TUIProjectManager.exe</a>"#;
+        let html = r#"<a href="/BeYourDreams/TUIProjectManager/releases/download/v2025.06.30.0001/TUIProjectManager.exe">TUIProjectManager.exe</a>"#;
         let a =
-            exe_asset_from_html(html, "qq458249269/TUIProjectManager", "v2025.06.30.0001").unwrap();
+            exe_asset_from_html(html, "BeYourDreams/TUIProjectManager", "v2025.06.30.0001").unwrap();
         assert_eq!(a.name, "TUIProjectManager.exe");
         // URL 必须带 owner/repo：旧实现拼的是 github.com/releases/download/…，
         // 少了这两段，HTML 源拿到的直链 100% 是死链。
         assert_eq!(
             a.url,
-            "https://github.com/qq458249269/TUIProjectManager/releases/download/v2025.06.30.0001/TUIProjectManager.exe"
+            "https://github.com/BeYourDreams/TUIProjectManager/releases/download/v2025.06.30.0001/TUIProjectManager.exe"
         );
     }
 
