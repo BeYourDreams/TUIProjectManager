@@ -23,7 +23,7 @@ const CONFIG_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 
 /// 定期检查更新的间隔：只在启动（一次）+ 此后每 10 分钟静默检查。
 /// 以前新开页签也会顺带触发一次全量检查，等于「用得越勤查得越勤」。
-const UPDATE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+const UPDATE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1800);
 
 /// 全部静止时的慢心跳帧间隔（cmd/conhost 式节能：无脏区不持续重绘）。
 /// 输出到达、鼠标/键盘事件都走 request_repaint() 即时唤醒，心跳只负责
@@ -653,8 +653,12 @@ fn fetch_tag_html(url: &str, connect_timeout: u64, max_time: u64) -> Result<Stri
 #[cfg(windows)]
 fn ps_run(script: &str) -> Result<String, String> {
     use std::os::windows::process::CommandExt;
-    let out = std::process::Command::new("powershell")
-        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    for k in ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
+        cmd.env_remove(k);
+    }
+    let out = cmd
         .args(["-NoProfile", "-NonInteractive", "-Command"])
         .arg(script)
         .output()
@@ -674,7 +678,7 @@ fn ps_fetch_body(url: &str, timeout_secs: u64) -> Result<String, String> {
     let script = format!(
         "[Console]::OutputEncoding=[Text.Encoding]::UTF8; \
          $ErrorActionPreference='Stop'; \
-         (Invoke-WebRequest -Uri '{url}' -Headers @{{'User-Agent'='TUIProjectManager'}} -TimeoutSec {t} -UseBasicParsing).Content",
+         [System.Net.WebRequest]::DefaultWebProxy=$null;          (Invoke-WebRequest -Uri '{url}' -Headers @{{'User-Agent'='TUIProjectManager'}} -TimeoutSec {t} -UseBasicParsing -Proxy $null).Content",
         url = url,
         t = timeout_secs,
     );
