@@ -3435,7 +3435,6 @@ const ICON_BUSY: u8 = 2;
 /// ❌ 已退出（渲染层直接给 ❌，不进快照）。
 const ICON_ERR: u8 = 3;
 /// state_icon 的位掩码：低 2 位图标码。
-const SNAP_CODE_MASK: u8 = 0b11;
 /// state_icon 的位：判定那一刻进程是否已退出。
 const SNAP_EXITED: u8 = 0b100;
 /// state_icon 的位：判定那一刻是否加载中。
@@ -3570,48 +3569,27 @@ fn tab_icon_from_snap(
     now_ms: u64,
     done_quiet_ms: u64,
 ) -> Option<&'static str> {
-    let snap = s.state_icon.load(Ordering::Relaxed);
-    if snap & SNAP_EXITED != 0 {
-        return Some("❌");
-    }
-    if snap & SNAP_LOADING != 0 {
-        return Some("🔄");
-    }
-    // 实时判据：与 refresh_tab_state 同一套输入（取两个屏幕时间戳的最新者）。
-    let code = live_icon_code(s, now_ms, done_quiet_ms).unwrap_or(snap & SNAP_CODE_MASK);
-    if viewed && code == ICON_DONE {
-        return None;
-    }
-    icon_from_code(code)
-}
-
-/// 「此刻」该是什么图标码：按实时的屏幕时间戳跑一遍 [`tab_icon`]（纯函数，
-/// 与 1s 快照用的判据完全一致）。返回 None = 此刻用不上实时值（未跑/加载中/
-/// 已退出），沿用快照。
-///
-/// 为什么只看它、不看别的：`tab_icon` 的 ✅ 分支同样过静默门槛，所以「屏幕已经
-/// 停够门槛而快照还挂 🔄」也会被这里纠正成 ✅——但这与快照算出的结果必然相同
-/// （同判据同输入），真正会被改变的是**时间戳在采样之后又推进过**的那半拍。
-fn live_icon_code(s: &crate::session::Session, now_ms: u64, done_quiet_ms: u64) -> Option<u8> {
-    if s.exited.load(Ordering::Acquire) {
-        return None; // 退出归快照的即时纠正路径（❌）
-    }
-    if s.loading_active(now_ms) {
-        return None; // 加载中同理（🔄）
-    }
+    // 直接按当前真实状态算，不再经 1s 采样快照中转：采样/快照的迟滞本身就是
+    // 「页签状态跟实际不一致」的来源。通知侧仍走 refresh_tab_state 的 1s 门限。
+    let exited = s.exited.load(Ordering::Acquire);
+    let loading = s.loading_active(now_ms);
     let last_change = s
         .last_content_ms
         .load(Ordering::Relaxed)
         .max(s.last_screen_change_ms.load(Ordering::Relaxed));
-    Some(icon_code(tab_icon(
-        false,
-        false,
+    let code = icon_code(tab_icon(
+        exited,
+        loading,
         s.output_count.load(Ordering::Relaxed),
-        s.has_been_viewed.load(Ordering::Relaxed),
+        viewed,
         last_change,
         now_ms,
         done_quiet_ms,
-    )))
+    ));
+    if viewed && code == ICON_DONE {
+        return None;
+    }
+    icon_from_code(code)
 }
 
 /// Tab 的轻量投影（Tab 持有 Session，坐标换算只需这四类）。
@@ -5296,7 +5274,8 @@ pad: tab_margin.left as f32 + tab_margin.right as f32,
                     // 判定只看终端输出，没有「用户驱动例外」。
                     // 状态快照：最快 1s 重算一次（STATE_CHECK_MS），退出/加载/
                     // 新实质内容这三类事件不等门限（见 state_due）。
-refresh_tab_state(s, now_ms, self.config.settings.done_quiet_ms);
+// 状态快照由 logic() 的 update_done_states 每帧统一刷新（含 1s 门限）；
+// 渲染路径只读，不再重复计算/写原子。
 let icon = tab_icon_from_snap(
                         s,
                         s.has_been_viewed.load(Ordering::Relaxed),
