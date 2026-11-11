@@ -60,13 +60,20 @@ fn window_activated_events(events: &[egui::Event]) -> bool {
         .any(|e| matches!(e, egui::Event::WindowFocused(true)))
 }
 
-/// 帧间隔决策：交互活跃（打字 **或** 滚动，不分档）> 输出在途 > 全静止。纯函数，便于自检。
+/// 帧间隔决策：前台时 交互活跃（打字 **或** 滚动，不分档）> 输出在途 > 全静止；
+/// 后台一律全静止档。纯函数，便于自检。
 /// 最快档 = 33ms，即**页签帧率锁 30 FPS**；busy 里的 10 FPS 不是拍脑袋：无输入
 /// 的持续高帧率重绘实测干扰 Windows 悬停激活窗口（30 FPS 失效、10 正常，见
 /// 921f062/0ae5904），所以帧率只对「窗口已被激活」的时刻放开。要更高输出
 /// 帧率先根治那个干扰源，再动 BUSY_FRAME_MS。
-fn frame_delay_ms(interacting: bool, busy: bool) -> u64 {
-    if interacting {
+fn frame_delay_ms(interacting: bool, busy: bool, app_fg: bool) -> u64 {
+    // 窗口不在前台 → 一律慢心跳，画面没人看。高帧率重绘在这里只有两笔账：
+    // 白烧 CPU；干扰 Windows「鼠标移入激活窗口」——这项功能只在**未激活**
+    // 窗口上发生，重叠的恰好就是这一档。回前台第一帧即恢复原档，人一坐下
+    // 就是正常帧率，感知不到降档。
+    if !app_fg {
+        IDLE_HEARTBEAT_MS
+    } else if interacting {
         INTERACT_FRAME_MS
     } else if busy {
         BUSY_FRAME_MS
@@ -4867,8 +4874,16 @@ s.last_reap_ms.store(now_ms, Ordering::Relaxed);
     /// 的时候做一次；关掉通知时这行零开销。
     fn alert_finished(title: &str, heading: &str, toast: bool, flash: bool, hwnd: isize) {
         if toast {
-            crate::ensure_toast_registered();
-            crate::notify_run_finished(title, heading);
+            // PowerShell 冷启动 100~300ms（首次还要先注册 AUMID 再起第二个进程）：
+            // 直接在 UI 线程上等它 = 整窗消息循环被按死这么久 —— 表现就是「界面
+            // 卡一下」，而 Windows 的悬停激活/timer 消息也在这期间排队（鼠标移入
+            // 激活窗口迟滞）。丢到后台线程，UI 线程只负责记事件。
+            let title = title.to_string();
+            let heading = heading.to_string();
+            std::thread::spawn(move || {
+                crate::ensure_toast_registered();
+                crate::notify_run_finished(&title, &heading);
+            });
         }
         if flash {
             crate::flash_taskbar(hwnd);
@@ -8477,7 +8492,8 @@ let now_ms = crate::now_ms();
                 }
             }
         }
-let delay_ms = frame_delay_ms(interacting, busy);
+let app_fg = crate::app_is_foreground(self.titlebar_hwnd, ctx.input(|i| i.focused));
+        let delay_ms = frame_delay_ms(interacting, busy, app_fg);
         ctx.request_repaint_after(std::time::Duration::from_millis(delay_ms));
         self.bg_frame = self.bg_frame.wrapping_add(1);
 
@@ -9182,15 +9198,19 @@ mod frame_delay_tests {
 use super::{frame_delay_ms, BUSY_FRAME_MS, IDLE_HEARTBEAT_MS, INTERACT_FRAME_MS};
     use eframe::egui;
 
-/// 帧间隔优先级：交互（打字或滚动，不分档）> 输出在途 > 全静止。顺序错了就是
-    /// 两个真实故障：交互判据排在 busy 之后 → 输出时打字回显仍按 100ms（延迟感）；
-    /// busy 与静止混为一谈 → 输出在途时落回 500ms 心跳（字块跳成慢动作）。
+    /// 帧间隔优先级：前台时交互（打字或滚动，不分档）> 输出在途 > 全静止。
+    /// 顺序错了就是两个真实故障：交互判据排在 busy 之后 → 输出时打字回显仍按
+    /// 100ms（延迟感）；busy 与静止混为一谈 → 输出在途时落回 500ms 心跳（字块
+    /// 跳成慢动作）。
     #[test]
     fn priority_interact_over_busy_over_idle() {
-        assert_eq!(frame_delay_ms(false, true), BUSY_FRAME_MS);
-        assert_eq!(frame_delay_ms(false, false), IDLE_HEARTBEAT_MS);
-        assert_eq!(frame_delay_ms(true, true), INTERACT_FRAME_MS);
-        assert_eq!(frame_delay_ms(true, false), INTERACT_FRAME_MS);
+        assert_eq!(frame_delay_ms(false, true, true), BUSY_FRAME_MS);
+        assert_eq!(frame_delay_ms(false, false, true), IDLE_HEARTBEAT_MS);
+        assert_eq!(frame_delay_ms(true, true, true), INTERACT_FRAME_MS);
+        assert_eq!(frame_delay_ms(true, false, true), INTERACT_FRAME_MS);
+        // 后台（窗口未激活）不分档：交互/输出/静止一律慢心跳。
+        assert_eq!(frame_delay_ms(true, true, false), IDLE_HEARTBEAT_MS);
+        assert_eq!(frame_delay_ms(false, true, false), IDLE_HEARTBEAT_MS);
         assert!(
             INTERACT_FRAME_MS < BUSY_FRAME_MS && BUSY_FRAME_MS < IDLE_HEARTBEAT_MS,
             "帧率档必须单调"
