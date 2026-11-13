@@ -82,16 +82,21 @@ fn frame_delay_ms(interacting: bool, busy: bool, app_fg: bool) -> u64 {
     }
 }
 
-/// 页签状态判定：只看**屏幕可见格的变化**（reader 逐块比对快照）——最近
-/// [`DONE_QUIET_MS`] 内屏幕**任何一个格**变过 → 🔄，之后整屏一个格都没变过 → ✅。
-/// 整屏重画同样的字（转义重绘）不算变化，所以静止画面不会被字节流误判成「在跑」。
-/// 不做进程树 CPU 采样，不按 agent 分家。
+/// 页签状态判定：最近 [`DONE_QUIET_MS`] 内**任一通道**有活动 → 🔄，两条都静够
+/// 时长 → ✅。通道只有两条，都是「事实观测」，不按 agent 分家：
+/// ① **屏幕可见格的变化**（reader 逐块比对快照）——整屏重画同样的字（转义重绘）
+///   不算变化，所以静止画面不会被字节流误判成「在跑」；
+/// ② **整棵进程树的 CPU 时间**（reader 之外的采样线程，见 session::cpu_tree）——
+///   屏幕不动但还在算（长推理 / 跑一条不出字的命令 / 工具执行期不重绘）靠它兜住，
+///   这正是纯屏幕启发式一直判不了的那一半。两者取最新（Session::last_activity_ms）：
+///   真在算的进程必然烧 CPU，而 1Hz 时钟那种定时重绘只有 ~0.3~2ms/s，在门槛外。
 ///
 /// 「任何一个格」是硬要求（用户反馈「git pull 已亮 ✅ 而进度还在刷」）：进度条
 /// 每跳只改 1~3 格，只认「≥4 格的成规模内容」就会漏掉它。代价是带 1Hz
 /// 时钟/秒表重绘的 TUI 常驻 🔄——屏幕上「时钟跳动」与「慢进度条」不可区分，
-/// 两边都要对只能回去采样进程 CPU。
-/// 另一侧代价：静默思考 / 网络等待（长时间屏幕不动）仍会被判为完成。
+/// 两边都要对只能回去采样进程 CPU（现已采，见上）。
+/// 另一侧代价：**纯网络等待**（不烧 CPU、屏幕也不动）仍会被判为完成——进程侧的
+/// 事实是「它没在算」，这已超出本工具能观测到的东西。
 ///
 /// 为什么门槛是 8s 而不是 3s（用户反馈「状态被误判完成，实际还在执行中」）：
 /// agent 回合里的静默极常见——按下回车到首个 token 到达（模型排队/网络）、跑一条
@@ -3489,36 +3494,15 @@ fn state_due(
     last_change_ms > last_check_ms
 }
 
-/// 后台页签切回前台那一次的**状态对账**（纯记账，不做判定）。
+/// 后台页签切回前台**不做**任何时间戳对账（曾经有过一次 `sync_screen_stamp`）。
 ///
-/// 为什么必须这一步：后台页签的画面**不渲染**（terminal.rs 只在当前页签上跑
-/// show_terminal），reader 却照旧在跑：它走“不重建整屏格子”的分支
-/// （session.rs 读循环），照样逐块比对可见格、照样刷
-/// `last_screen_change_ms`。于是出现两条只有后台页签才有的错：
-///
-/// ① **陈旧**：后台页签那串时间戳是它在后台期间攒下的，切回前台时 UI 才第一次
-///   真正画出这一屏。若它最后变化发生在 8s 之前，切回的第一帧就已经过了门槛 ——
-///   用户明明刚看见画面（可能还在动），图标却直接给 ✅/空。
-/// ② **整屏假变化**：reader 的 `prev_screen` 是它自己逐块推进的，而前台那份快照
-///   在后台期间没重建（cells_stale）。切回那帧 UI 就地重建快照，reader 下一次
-///   比对用的是**另一条路的字符序列**；两者长度/内容对不上时 diff 被算成整屏
-///   变化（`prev_screen.len() != now_chars.len()` 的分支）→ 时间戳刷成“刚刚变过”
-///   → 静止的页签被判 🔄。窗口 resize 过（列数变了）时这条必中。
-///
-/// 记账的办法很土但够用：切回前台的那一刻（UI 就在这一帧重建快照）把
-/// `last_screen_change_ms` 顶到当前时刻，让「静默多久」从**切回这一刻**重新起算，
-/// ①②两头一起断掉——既不再拿后台攒下的陈旧时间戳直接判完成，也不再让两路
-/// 快照的口径差算出一次假的“刚变过”。代价是切回后最多多挂一个门槛期的 🔄
-/// （用户正盯着这个页签、画面就在眼前，这个方向的迟滞远比谎报完成可接受）。
-fn sync_screen_stamp(s: &crate::session::Session, now_ms: u64) {
-    resync_stamp(&s.last_screen_change_ms, now_ms);
-}
-
-/// [`sync_screen_stamp`] 的记账本体（拿原子做参数，便于单测）。
-fn resync_stamp(screen: &std::sync::atomic::AtomicU64, now_ms: u64) {
-    screen.store(now_ms, Ordering::Relaxed);
-}
-
+/// 老实现切回那一刻把 `last_screen_change_ms` 顶到当前时刻，防的是两件事：
+/// ① 拿后台攒下的陈旧时间戳直接判完成；② resize 凑出的整屏假变化被记成「刚变过」。
+/// ② 已由 `diff_screen_cells` 的 `resized` 分支根治（resize 一个时间戳都不刷）；
+/// ① 的代价是**切回后必挂一个门槛期的 🔄**——画面明明就在眼前、进程也没在算，
+/// 这正是「切后台再切回来状态误判」的主因。而屏幕静默但仍在算的那一类，已由
+/// CPU 通道挡住（session::cpu_tree）：切回时真还有活干，`busy_ms` 自己会把图标
+/// 摁在 🔄，不需要这道无条件延迟。
 /// App 侧的快照刷新：把图标 + 完成态**一起**算进 Session 的原子里。
 ///
 /// 页签图标（tab_bar）与「任务完成」通知（update_done_states）都只读这份快照，
@@ -3528,12 +3512,9 @@ fn refresh_tab_state(s: &crate::session::Session, now_ms: u64, done_quiet_ms: u6
     let snap = s.state_icon.load(Ordering::Relaxed);
     let exited = s.exited.load(Ordering::Acquire);
     let loading = s.loading_active(now_ms);
-    // 状态只看「屏幕上**任何**一次变化」（成规模内容或 1~3 格小跳动取最新）：
-    // git pull 的进度逐格爬只改 1~3 格，`last_content_ms` 不刷新它，会卡在 ✅。
-    let last_change = s
-        .last_content_ms
-        .load(Ordering::Relaxed)
-        .max(s.last_screen_change_ms.load(Ordering::Relaxed));
+    // 状态只看「最近一次活动」= 屏幕变化与进程树 CPU 取最新（见
+    // Session::last_activity_ms）：屏幕逐格爬的进度条与静默烧 CPU 的回合都算在跑。
+    let last_change = s.last_activity_ms();
     if !state_due(last_check, now_ms, last_change, snap, exited, loading) {
         return;
     }
@@ -3580,10 +3561,7 @@ fn tab_icon_from_snap(
     // 「页签状态跟实际不一致」的来源。通知侧仍走 refresh_tab_state 的 1s 门限。
     let exited = s.exited.load(Ordering::Acquire);
     let loading = s.loading_active(now_ms);
-    let last_change = s
-        .last_content_ms
-        .load(Ordering::Relaxed)
-        .max(s.last_screen_change_ms.load(Ordering::Relaxed));
+    let last_change = s.last_activity_ms();
     let code = icon_code(tab_icon(
         exited,
         loading,
@@ -8403,23 +8381,17 @@ impl eframe::App for ClientApp {
         // 这两处：终端内的打字/滚轮/点击**不算**——回显与真输出同路，状态只该看输出。
         // 没交互过就一直算「未查看」→ 激活页签跑完照样亮 ✅；新一轮输出会复位
         // viewed（session.rs 读循环），下一轮跑完再亮。
-        let now_ms = crate::now_ms();
         for (i, t) in self.tabs.iter().enumerate() {
             if let Tab::Session(s) = t {
                 // foreground 只管「是不是当前页签」（update_exited 用它决定退出
                 // 判定的频率），**不**跟着 app_fg 走：改它会让失焦时退出回收退到
                 // 低频轮询，与本需求无关。
                 let fg = i == self.current;
-                // ── 后台 → 前台的那一次：状态对账 ──
-                // 后台页签不渲染但 reader 照跑（时间戳照刷），前台那份快照也没
-                // 重建（cells_stale）。切回这一刻让「静默多久」重新起算（见
-                // sync_screen_stamp）：状态从用户此刻真正看到的画面开始判。
-                // swap 取旧值 = 只在**跃迁**那一次记账，前台每帧反复写不会
-                // 把静默计时一直摁在 0（那样 🔄 永驻、✅ 永不亮）。
-                let was_fg = s.foreground.swap(fg, Ordering::Relaxed);
-                if fg && !was_fg {
-                    sync_screen_stamp(s, now_ms);
-                }
+                // 只同步「是不是当前页签」这一个事实（reader 据此决定要不要唤醒
+                // UI / 重建整屏格子，update_exited 据此选收割频率）。切回前台**不**
+                // 动任何时间戳：后台期间 reader 照跑、时间戳照刷，攒下的那份就是
+                // 真相；再人为清零只会让刚看过的那一屏白挂一个门槛期的 🔄。
+                s.foreground.store(fg, Ordering::Relaxed);
             }
         }
 
@@ -8987,10 +8959,9 @@ if self.spawning.is_empty() && !self.restore_slots.is_empty() {
 #[cfg(test)]
 mod tab_icon_tests {
     use super::{
-        icon_code, resync_stamp, state_due, tab_icon, toast_quiet_enough, DONE_QUIET_MS,
-        ICON_BUSY, ICON_DONE, ICON_EMPTY, SNAP_EXITED, STATE_CHECK_MS, TOAST_QUIET_MS,
+        icon_code, state_due, tab_icon, toast_quiet_enough, DONE_QUIET_MS, ICON_BUSY,
+        ICON_DONE, ICON_EMPTY, SNAP_EXITED, STATE_CHECK_MS, TOAST_QUIET_MS,
     };
-    use std::sync::atomic::Ordering;
 
     /// 只喂「屏幕最后一次变化距今多久」+「是否已查看」。
     fn icon(count: u32, viewed: bool, silent_ms: u64) -> Option<&'static str> {
@@ -9126,45 +9097,23 @@ assert_eq!(tab_icon(false, false, 10, false, 0, 100_000, DONE_QUIET_MS), None);
         assert_eq!(code(DONE_QUIET_MS - 1, false), ICON_BUSY);
     }
 
-    /// 后台 → 前台那一次的状态对账：切回时把屏幕时间戳顶到当前时刻，于是
-    /// 「静默多久」从切回这一刻重新起算，而不是接着后台攒下的陈旧时间戳算。
-    /// 不做的话，后台页签攒下的时间戳要么让 ✅ 早亮（陈旧），要么被两路快照
-    /// 口径差算成「刚变过」而常驻 🔄。
+    /// 两条通道取并集（`Session::last_activity_ms` 的语义）：屏幕静默很久，但
+    /// 进程树刚烧过 CPU → 仍然 🔄。这正是「长推理 / 跑一条不出字的命令」被谎报
+    /// 完成（+ 误弹通知）的那一类；没有 CPU 通道时同一份输入会亮 ✅。
     #[test]
-    fn sync_screen_stamp_restarts_the_silence_timer() {
-        // 纯记账函数：把此刻写进 last_screen_change_ms。
-        let screen = std::sync::atomic::AtomicU64::new(1_000);
-        resync_stamp(&screen, 50_000);
-        assert_eq!(screen.load(Ordering::Relaxed), 50_000);
-        // 归零重算的直接结果：刚切回时不判完成（🔄），而不是拿 1_000 那个
-        // 陈旧时间戳算出「已静默 49s → ✅」。
-        let now = 50_000u64;
+    fn cpu_activity_keeps_a_silent_tab_busy() {
+        let now = 100_000u64;
+        let screen = now - 60_000; // 屏幕静止 1 分钟
+        let cpu = now - 500; // 进程树半秒前还在算
         assert_eq!(
-            icon_code(tab_icon(
-                false,
-                false,
-                10,
-                false,
-                screen.load(Ordering::Relaxed),
-                now,
-                DONE_QUIET_MS,
-            )),
-            ICON_BUSY,
-            "刚切回前台的页签按实际画面判：先看一眼再下结论"
+            tab_icon(false, false, 10, false, screen.max(cpu), now, DONE_QUIET_MS),
+            Some("🔄"),
+            "CPU 通道有新活动就不许判完成"
         );
-        // 对照：不对账（沿用陈旧时间戳）就是「谎报完成」这条老毛病。
+        // 对照：只有屏幕通道（旧行为）= 谎报完成。
         assert_eq!(
-            icon_code(tab_icon(
-                false,
-                false,
-                10,
-                false,
-                1_000,
-                now,
-                DONE_QUIET_MS,
-            )),
-            ICON_DONE,
-            "不对账就会拿后台攒下的陈旧时间戳直接判完成"
+            tab_icon(false, false, 10, false, screen, now, DONE_QUIET_MS),
+            Some("✅")
         );
     }
 
