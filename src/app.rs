@@ -82,21 +82,13 @@ fn frame_delay_ms(interacting: bool, busy: bool, app_fg: bool) -> u64 {
     }
 }
 
-/// 页签状态判定：最近 [`DONE_QUIET_MS`] 内**任一通道**有活动 → 🔄，两条都静够
-/// 时长 → ✅。通道只有两条，都是「事实观测」，不按 agent 分家：
-/// ① **屏幕可见格的变化**（reader 逐块比对快照）——整屏重画同样的字（转义重绘）
-///   不算变化，所以静止画面不会被字节流误判成「在跑」；
-/// ② **整棵进程树的 CPU 时间**（reader 之外的采样线程，见 session::cpu_tree）——
-///   屏幕不动但还在算（长推理 / 跑一条不出字的命令 / 工具执行期不重绘）靠它兜住，
-///   这正是纯屏幕启发式一直判不了的那一半。两者取最新（Session::last_activity_ms）：
-///   真在算的进程必然烧 CPU，而 1Hz 时钟那种定时重绘只有 ~0.3~2ms/s，在门槛外。
+/// 页签状态判定：只看**屏幕可见格的变化**（reader 逐块比对快照）。最近
+/// [`DONE_QUIET_MS`] 内屏幕**任何一个格**变过（含单格动画/进度）→ 🔄，
+/// 静够时长 → ✅。整屏重画同样的字（转义重绘）与 resize 凑出的 diff 不算变化。
 ///
-/// 「任何一个格」是硬要求（用户反馈「git pull 已亮 ✅ 而进度还在刷」）：进度条
-/// 每跳只改 1~3 格，只认「≥4 格的成规模内容」就会漏掉它。代价是带 1Hz
-/// 时钟/秒表重绘的 TUI 常驻 🔄——屏幕上「时钟跳动」与「慢进度条」不可区分，
-/// 两边都要对只能回去采样进程 CPU（现已采，见上）。
-/// 另一侧代价：**纯网络等待**（不烧 CPU、屏幕也不动）仍会被判为完成——进程侧的
-/// 事实是「它没在算」，这已超出本工具能观测到的东西。
+/// 「任何一个格」：网络请求等单格 spinner/进度动画会刷新活动时间戳，保持 🔄；
+/// 代价是 1Hz 时钟/秒表这类持续小刷新也会常驻 🔄（与慢进度在屏幕上不可区分）。
+/// 另一侧代价：真·无任何画面变化的静默等待会在门槛后被判为完成。
 ///
 /// 为什么门槛是 8s 而不是 3s（用户反馈「状态被误判完成，实际还在执行中」）：
 /// agent 回合里的静默极常见——按下回车到首个 token 到达（模型排队/网络）、跑一条
@@ -3391,9 +3383,9 @@ fn watched(is_current: bool, app_fg: bool) -> bool {
 
 /// 页签状态图标（纯函数；参数与 [`Session`] 的屏幕时间戳一一对应，便于逐项钉住）。
 ///
-/// 一律只看**屏幕可见格的变化**，不按 agent 分家、不追 JSONL/DB：reader 逐块
-/// 把可见格字符与上次快照比对，`last_change` = 最近一次**任何一个格**变了的时刻
-/// （由 reader 的 `last_screen_change_ms` / `last_content_ms` 取最新）。
+/// 一律只看**屏幕可见格的变化**（纯画面对比），不按 agent 分家、不追 JSONL/DB：
+/// reader 逐块把可见格字符与上次快照比对，`last_change` = 最近一次**任何一个格**
+/// 变了的时刻（`last_screen_change_ms` / `last_content_ms` 取最新）。
 ///
 /// 为什么不用「收到字节 / 转义占比」：全屏 TUI 每帧把整屏同样的字重画一遍，
 /// 字节一直来、转义占比也判不准，于是「静止画面」被判成「一直在跑」→ 🔄 常驻、
@@ -3494,15 +3486,6 @@ fn state_due(
     last_change_ms > last_check_ms
 }
 
-/// 后台页签切回前台**不做**任何时间戳对账（曾经有过一次 `sync_screen_stamp`）。
-///
-/// 老实现切回那一刻把 `last_screen_change_ms` 顶到当前时刻，防的是两件事：
-/// ① 拿后台攒下的陈旧时间戳直接判完成；② resize 凑出的整屏假变化被记成「刚变过」。
-/// ② 已由 `diff_screen_cells` 的 `resized` 分支根治（resize 一个时间戳都不刷）；
-/// ① 的代价是**切回后必挂一个门槛期的 🔄**——画面明明就在眼前、进程也没在算，
-/// 这正是「切后台再切回来状态误判」的主因。而屏幕静默但仍在算的那一类，已由
-/// CPU 通道挡住（session::cpu_tree）：切回时真还有活干，`busy_ms` 自己会把图标
-/// 摁在 🔄，不需要这道无条件延迟。
 /// App 侧的快照刷新：把图标 + 完成态**一起**算进 Session 的原子里。
 ///
 /// 页签图标（tab_bar）与「任务完成」通知（update_done_states）都只读这份快照，
@@ -3512,8 +3495,7 @@ fn refresh_tab_state(s: &crate::session::Session, now_ms: u64, done_quiet_ms: u6
     let snap = s.state_icon.load(Ordering::Relaxed);
     let exited = s.exited.load(Ordering::Acquire);
     let loading = s.loading_active(now_ms);
-    // 状态只看「最近一次活动」= 屏幕变化与进程树 CPU 取最新（见
-    // Session::last_activity_ms）：屏幕逐格爬的进度条与静默烧 CPU 的回合都算在跑。
+    // 状态只看最近一次屏幕活动（任意可见格变化，含单格动画/进度）。
     let last_change = s.last_activity_ms();
     if !state_due(last_check, now_ms, last_change, snap, exited, loading) {
         return;
@@ -9095,26 +9077,6 @@ assert_eq!(tab_icon(false, false, 10, false, 0, 100_000, DONE_QUIET_MS), None);
         // 门槛差 1ms 都不放行：🚦 与 ✅ 的边界必须与快照那份完全一致
         // （同判据同输入，两个消费者不许各判各的）。
         assert_eq!(code(DONE_QUIET_MS - 1, false), ICON_BUSY);
-    }
-
-    /// 两条通道取并集（`Session::last_activity_ms` 的语义）：屏幕静默很久，但
-    /// 进程树刚烧过 CPU → 仍然 🔄。这正是「长推理 / 跑一条不出字的命令」被谎报
-    /// 完成（+ 误弹通知）的那一类；没有 CPU 通道时同一份输入会亮 ✅。
-    #[test]
-    fn cpu_activity_keeps_a_silent_tab_busy() {
-        let now = 100_000u64;
-        let screen = now - 60_000; // 屏幕静止 1 分钟
-        let cpu = now - 500; // 进程树半秒前还在算
-        assert_eq!(
-            tab_icon(false, false, 10, false, screen.max(cpu), now, DONE_QUIET_MS),
-            Some("🔄"),
-            "CPU 通道有新活动就不许判完成"
-        );
-        // 对照：只有屏幕通道（旧行为）= 谎报完成。
-        assert_eq!(
-            tab_icon(false, false, 10, false, screen, now, DONE_QUIET_MS),
-            Some("✅")
-        );
     }
 
     /// 采样快照回归（用户反馈「后台页签明明在跑，状态却经常变空」）：图标读的是

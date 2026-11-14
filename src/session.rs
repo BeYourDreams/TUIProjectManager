@@ -252,11 +252,6 @@ pub struct Session {
     /// 最近一次「**成规模**内容变化」的时刻：单块变化 ≥ [`MIN_CONTENT_CELLS`]
     /// 个可见格。只给「任务完成」通知侧的门槛用（图标不看它，只看上面那个）。
     pub last_content_ms: Arc<AtomicU64>,
-    /// 最近一次**整棵进程树真的烧了 CPU** 的时刻（采样线程写，见 [`cpu_tree`]）。
-    /// 与屏幕时间戳取并集当「最近一次活动」（[`Session::last_activity_ms`]）：
-    /// 屏幕静默但还在算的任务（长推理、跑一条不出字的命令）靠它挡住谎报完成。
-    /// 0 = 从未观测到 CPU 活动（挂不上 job / 真空闲）。它是事实观测，不开放成配置。
-    pub busy_ms: Arc<AtomicU64>,
     /// 「运行/完成」状态快照的上次重算时刻（毫秒）。门限 STATE_CHECK_MS（1s）：
     /// 每个页签最快一秒重算一次，其余帧复用快照——降低检测频率，也让图标不再
     /// 亚秒抖动（🔄↔✅ 来回闪）。
@@ -730,8 +725,8 @@ static CONPTY_DLL: &[u8] = include_bytes!("../assets/conpty/conpty.dll");
 #[cfg(windows)]
 static OPENCONSOLE_EXE: &[u8] = include_bytes!("../assets/conpty/OpenConsole.exe");
 
-// 页签状态判定已改纯内容制（见 app.rs tab_icon）：进程树 CPU 采样与后台
-// 锁存全量移除——间隔输出/静默间隙一律按「3s 无内容即完成」判定。
+// 页签状态判定：纯屏幕可见格变化（见 app.rs tab_icon）。任意可见格变化
+// 刷新活动时间戳，静默满门槛判完成；1~3 格的动画/进度同样算活动。
 
 /// loading 标志的墙钟上限（见 Session::loading_active）。reader 线程只在「有
 /// 输出」时才会清 loading（首个非动画块 / 3s 兜底）；零输出会话（sleep、静默
@@ -836,155 +831,6 @@ fn ensure_bundled_conpty() {
             SetDllDirectoryW(wide.as_ptr());
         }
     });
-}
-
-/// 进程树 CPU 采样的轮询间隔：500ms 与慢心跳同档，既够细（判据落在静默门槛里，
-/// 最小 1s），又不至于每帧一次系统调用。
-#[cfg(windows)]
-const CPU_SAMPLE_MS: u64 = 500;
-/// 一个采样周期内整棵进程树的 CPU 时间增量 ≥ 此值即判「在算」（≈1% 核：5ms/500ms）。
-/// 1Hz 时钟 / 呼吸光标这类定时重绘（≈0.3~2ms/s）留在门槛外，真在生成 token /
-/// 编译 / 跑测试的进程远超它。
-#[cfg(windows)]
-const CPU_BUSY_MS: u64 = 5;
-
-/// 进程树 CPU 采样（Windows job object）：判「屏幕没动、进程还在算」。
-///
-/// 为什么需要它：屏幕启发式判不了「静默但仍在算」——长推理、跑一条不出字的命令、
-/// 工具执行期不重绘，屏幕与「回合真的跑完了」完全同形，只能整体后延静默门槛
-/// （代价是 ✅ 迟亮）。CPU 时间是这条的另一半事实：真在跑就必然烧 CPU。它不能
-/// 单独当判据（1Hz 时钟的 TUI 也烧一点），但与屏幕取「最近一次活动」的并集刚好
-/// 互补：任一通道有活动就不判完成（见 app.rs tab_icon）。
-///
-/// 用 job object 而不是 GetProcessTimes(pid)：agent 常是 `pi → node` 两层，孙进程
-/// 继承 job 成员资格，一次查询就涵盖整棵树。子进程已在别的 job 里也能挂
-/// （Win8+ 支持嵌套 job）；挂不上就退化成没有这条通道，会话照常跑。
-#[cfg(windows)]
-mod cpu_tree {
-    use std::ffi::c_void;
-    use std::ptr::from_mut;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-    use super::{CPU_BUSY_MS, CPU_SAMPLE_MS};
-
-    /// JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION（winnt.h）。
-    #[repr(C)]
-    #[derive(Default)]
-    struct BasicAccounting {
-        total_user: i64,
-        total_kernel: i64,
-        period_user: i64,
-        period_kernel: i64,
-        page_faults: u32,
-        total_processes: u32,
-        active_processes: u32,
-        terminated_processes: u32,
-    }
-
-    const JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION: i32 = 1;
-    /// AssignProcessToJobObject 要求这两个权限。
-    const PROCESS_SET_QUOTA: u32 = 0x0100;
-    const PROCESS_TERMINATE: u32 = 0x0001;
-
-    unsafe extern "system" {
-        fn CreateJobObjectW(attrs: *const c_void, name: *const u16) -> isize;
-        fn AssignProcessToJobObject(job: isize, process: isize) -> i32;
-        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
-        fn QueryInformationJobObject(
-            job: isize,
-            class: i32,
-            info: *mut c_void,
-            len: u32,
-            ret_len: *mut u32,
-        ) -> i32;
-        fn CloseHandle(handle: isize) -> i32;
-    }
-
-    /// 一个会话的 job object（Drop 关句柄）。
-    pub(super) struct Job(isize);
-
-    impl Job {
-        /// 把 pid 挂进新 job；None = 这台机器挂不上（本通道关闭，不影响会话）。
-        pub(super) fn attach(pid: u32) -> Option<Self> {
-            unsafe {
-                let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-                if job == 0 {
-                    return None;
-                }
-                let proc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
-                if proc == 0 {
-                    CloseHandle(job);
-                    return None;
-                }
-                let ok = AssignProcessToJobObject(job, proc);
-                CloseHandle(proc);
-                if ok == 0 {
-                    CloseHandle(job);
-                    return None;
-                }
-                Some(Self(job))
-            }
-        }
-
-        /// 整棵树累计 CPU 时间（100ns 单位）。
-        pub(super) fn cpu_time(&self) -> Option<i64> {
-            let mut info = BasicAccounting::default();
-            let ok = unsafe {
-                QueryInformationJobObject(
-                    self.0,
-                    JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION,
-                    from_mut(&mut info).cast(),
-                    std::mem::size_of::<BasicAccounting>() as u32,
-                    std::ptr::null_mut(),
-                )
-            };
-            (ok != 0).then_some(info.total_user + info.total_kernel)
-        }
-    }
-
-    impl Drop for Job {
-        fn drop(&mut self) {
-            unsafe {
-                CloseHandle(self.0);
-            }
-        }
-    }
-
-    /// 一次采样的判忙逻辑（采样线程与自检共用）：推进基线，回答「本周期在算吗」。
-    /// 采样失败（句柄失效）一律当空闲，不改基线。
-    pub(super) fn take_sample(job: &Job, last: &mut i64) -> bool {
-        let Some(now) = job.cpu_time() else { return false };
-        let busy = (now - *last) / 10_000 >= CPU_BUSY_MS as i64;
-        *last = now;
-        busy
-    }
-
-    /// 采样线程：每 `CPU_SAMPLE_MS` 看一眼整棵树，忙就刷新 `busy_ms`；会话退出即收手。
-    pub fn watch(pid: u32, busy_ms: Arc<AtomicU64>, exited: Arc<AtomicBool>) {
-        std::thread::spawn(move || {
-            let Some(job) = Job::attach(pid) else {
-                // 挂不上（权限/被别的 job 占死/系统限制）：这条通道安静关闭，
-                // 页签状态退化成纯屏幕启发式。记一笔进 crash.log 便于复盘。
-                crate::log_crash(
-                    "cpu-tree-disabled",
-                    &format!("pid {pid} 挂不上 job object，页签状态只剩屏幕通道"),
-                );
-                return;
-            };
-            // 基线：第一次采样只记账不判忙，免得把「挂 job 之前」攒的 CPU 当增量。
-            let mut last = job.cpu_time().unwrap_or(0);
-            while !exited.load(Ordering::Acquire) {
-                std::thread::sleep(std::time::Duration::from_millis(CPU_SAMPLE_MS));
-                if exited.load(Ordering::Acquire) {
-                    break;
-                }
-                if take_sample(&job, &mut last) {
-                    busy_ms.store(crate::now_ms(), Ordering::Relaxed);
-                }
-            }
-        });
-    }
 }
 
 /// 在项目目录下启动一个会话，运行配置的 TUI 命令。
@@ -1659,14 +1505,6 @@ guard_ctx.request_repaint();
     });
     }
 
-    // 进程树 CPU 采样：屏幕没动却还在算的任务靠它兜住（见 cpu_tree 与 app.rs
-    // tab_icon）。挂不上 job（权限/系统限制）就静默退化，会话照常跑。
-    let busy_ms = Arc::new(AtomicU64::new(0));
-    #[cfg(windows)]
-    if let Some(pid) = child.process_id() {
-        cpu_tree::watch(pid, busy_ms.clone(), exited.clone());
-    }
-
     let session = Session {
         title: title.to_string(),
         dir: dir.to_string(),
@@ -1705,7 +1543,6 @@ guard_ctx.request_repaint();
         last_scroll_ms,
         last_screen_change_ms,
         last_content_ms,
-        busy_ms,
         state_check_ms,
         state_icon,
         state_done,
@@ -1733,13 +1570,12 @@ impl Session {
             && now_ms.saturating_sub(self.started_ms.load(Ordering::Relaxed)) < LOADING_MAX_MS
     }
 
-    /// 「最近一次活动」= 屏幕可见格变化 / 成规模内容 / 进程树烧 CPU 三者取最新。
-    /// 页签完成判据（app.rs `tab_icon`）只看这一个数：任一通道有活动就还在跑。
+    /// 「最近一次活动」= 屏幕可见格变化 / 成规模内容取最新（纯画面对比）。
+    /// 任意可见格变化（含单格动画）都会刷新 screen 时间戳。
     pub fn last_activity_ms(&self) -> u64 {
         let screen = self.last_screen_change_ms.load(Ordering::Relaxed);
         let content = self.last_content_ms.load(Ordering::Relaxed);
-        let cpu = self.busy_ms.load(Ordering::Relaxed);
-        screen.max(content).max(cpu)
+        screen.max(content)
     }
 
     /// 将 child 和 master 都移到后台线程异步清理，避免 Child::drop / MasterPty::drop
@@ -1750,7 +1586,6 @@ impl Session {
     pub fn kill_in_background(&mut self) {
         // 程序化终止不弹「运行结束」提醒（首次启动的会话此刻未必被 update_exited 处理过）。
         self.notified.store(true, Ordering::Relaxed);
-        // 让 CPU 采样线程收手（否则它会抱着 job 句柄空转，拖到 500ms 采样才停）。
         self.exited.store(true, Ordering::Release);
         let child = self.child.take();
         let master = self.master.take();
@@ -1813,44 +1648,6 @@ sess.last_snapshot_offset = offset_val;
 mod tests {
 use super::*;
     use alacritty_terminal::term::cell::Flags;
-
-    /// CPU 通道自检（真跑 Win32 job object）：整棵树忙转 → 判忙；空等 → 不判忙。
-    /// 这两条就是「屏幕静默但还在算」与「真的跑完了」在进程侧的区分（见 app.rs
-    /// tab_icon：它把这通道与屏幕时间戳取并集）。
-    #[cfg(windows)]
-    #[test]
-    fn cpu_tree_judges_busy_and_idle() {
-        // 纯算 300ms：远超阈值（5ms/500ms），别的测试并发也翻不了这个结论。
-        let spin = |ms: u64| {
-            let until = std::time::Instant::now() + std::time::Duration::from_millis(ms);
-            let mut x = 0u64;
-            while std::time::Instant::now() < until {
-                x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
-            }
-            x
-        };
-        // ① 忙：采样本测试进程（挂不上 job 就跳过——生产里同样退化成没有这条通道）。
-        if let Some(job) = cpu_tree::Job::attach(std::process::id()) {
-            let mut last = job.cpu_time().unwrap_or(0);
-            let x = spin(300);
-            assert!(cpu_tree::take_sample(&job, &mut last), "忙转 300ms 必被采到（{x}）");
-        }
-        // ② 闲：整棵树空等（timeout 自己 + cmd 父进程），不该判忙。
-        let mut child = std::process::Command::new("cmd")
-            .args(["/C", "timeout /t 3 /nobreak >nul"])
-            .spawn()
-            .expect("起 timeout 子进程");
-        if let Some(job) = cpu_tree::Job::attach(child.id()) {
-            // 先越过 cmd/timeout 自身的启动开销（那几百毫秒确实在烧 CPU，跟生产
-            // 里会话启动期同样算「在跑」，不影响判断），再从干净基线看纯等待期。
-            std::thread::sleep(std::time::Duration::from_millis(600));
-            let mut last = job.cpu_time().unwrap_or(0);
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            assert!(!cpu_tree::take_sample(&job, &mut last), "空等的进程树不该判忙");
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-    }
 
     /// 屏幕变化 → 两个时间戳的记账约定（app.rs tab_icon 的输入源）。
     /// ① 零变化（整屏重画同样的字）：一个时间戳都不刷——「静止却常亮 🔄」的根因；
