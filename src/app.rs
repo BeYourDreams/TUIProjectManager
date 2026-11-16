@@ -162,6 +162,11 @@ pub enum Screen {
 }
 
 /// 顶部页签：第一个永远是首页，后面每个对应一个终端会话。
+///
+/// 设置**不是**页签（原先是常驻的 `⚙ 设置` 页签，已删）：它改成右下角一颗
+/// 「⚙ 设置」按钮 + 一个可关闭、可拖动的浮层窗口，见 `settings_button` /
+/// `settings_window`。理由：设置是低频动作，不值得常驻页签栏、也不该被
+/// Ctrl+Tab / 拖拽重排 / 页签滚动一起卷进来。
 pub enum Tab {
     Home,
     // Session 承载大量缓存（galley/图集/hash 缓冲）约 26KB，
@@ -170,7 +175,6 @@ pub enum Tab {
     /// 重启/切换命令期间的占位页签：保持位置不变，标题可见，
     /// 防止页签消失再出现的闪烁。
     Placeholder { title: String },
-    Settings,
 }
 
 /// 待下一帧在会话页签布局里重新启动/切换命令的会话（异步，不阻塞 UI）。
@@ -2866,25 +2870,25 @@ fn anchor_tag_on_assets(spec: &ToolSpec, probed: String) -> String {
     probed
 }
 
-/// Ctrl+(Shift+)Tab 的落点：**只在页签栏里的页签之间循环，不碰首页 / 设置页**。
+/// Ctrl+(Shift+)Tab 的落点：**只在页签栏里的页签之间循环，不碰首页**。
 ///
 /// 旧实现是在整个 `tabs` 上做 `(current ± 1) % len`，于是快捷键会把人从第一个
-/// 项目页签直接甩到「首页」，再按一下又进「设置」——这两个是**页面**不是**页签**，
-/// 手不离键盘想回到项目里得连按好几下，而且很容易在两个页面之间来回弹
-/// （设置页里还嵌着大量控件，一进去连 Ctrl+Tab 的手感都变了）。
+/// 项目页签直接甩到「首页」——首页是**页面**不是**页签**，手不离键盘想回到项目里
+/// 得再按一下，很容易在首页与项目之间来回弹。（当时「设置」也是常驻页签，一并
+/// 被卷进来；现在设置是右下角浮层，压根不在 `tabs` 里。）
 ///
 /// 规则（`fwd` = Ctrl+Tab 前进，`false` = Ctrl+Shift+Tab 后退）：
-///  - 候选集 = 除 `Home` / `Settings` 外的全部页签（会话页签 + 重启/切换期间的
+///  - 候选集 = 除 `Home` 外的全部页签（会话页签 + 重启/切换期间的
 ///    `Placeholder` 占位页签——占位页签就是一个真实的位置，允许落上去）；
 ///  - 当前页已在候选集里 → 在**候选集内部**走一步（不是整个 tabs 走一步）；
-///  - 当前页是首页/设置 → 前进跳候选集**第一个**、后退跳**最后一个**，
-///    第一次按就能进页签区，但**永远不会落在首页/设置上**；
+///  - 当前页是首页 → 前进跳候选集**第一个**、后退跳**最后一个**，
+///    第一次按就能进页签区，但**永远不会落在首页上**；
 ///  - 候选集为空（还没开过任何项目）→ None，按键不做事。
 ///
 /// 纯函数（只读 tabs，不碰 self），便于单测钉住行为。
 fn tab_cycle_target(tabs: &[Tab], current: usize, fwd: bool) -> Option<usize> {
     let ring: Vec<usize> = (0..tabs.len())
-        .filter(|i| !matches!(tabs[*i], Tab::Home | Tab::Settings))
+        .filter(|i| !matches!(tabs[*i], Tab::Home))
         .collect();
     if ring.is_empty() {
         return None;
@@ -3224,6 +3228,16 @@ pub struct ClientApp {
     pub config: config::Config,
     pub tabs: Vec<Tab>,
     pub current: usize,
+    /// 设置窗口（右下角「⚙ 设置」弹层）是否打开。
+    ///
+    /// **不默认打开**：启动一律收起（它不再是页签，也就不存在「上次停在设置页」
+    /// 这回事）。关掉后 `current` 若正指着首页就留在首页，指着会话则回会话。
+    pub settings_open: bool,
+    /// 设置窗口**本帧**左上角（窗口坐标，左上角原点）。
+    ///
+    /// 每帧由 `settings_win_pos` 现算：用户没拖过就贴右下角；拖过就用存下的
+    /// 位置（再夹进窗口内，防止缩小窗口/换显示器后飘到看不见的地方）。
+    settings_win_pos: egui::Pos2,
     pub screen: Screen,
     pub selected_project: usize,
     pub settings_command: String,
@@ -3567,38 +3581,68 @@ enum TabKind {
     Alive,
     /// 已退出的会话 / 重启占位：不恢复，坐标中不占位。
     Gone,
-    Settings,
 }
 
 /// 计算持久化的 (active, settings_pos)，坐标系 = 恢复后的页签数组：
-/// [Home, Settings] + 存活会话，已退出页签不恢复。最后 current = active（见 ui()
+/// [Home] + 存活会话，已退出页签不恢复。最后 current = active（见 ui()
 /// 恢复流程）。直接存 self.current（满页签索引）会整体左移错位（active 落到
 /// 隔壁页签），故必须先滤掉已退出的。
-/// settings_pos 恒为 1：设置页签**常驻**在首页之后（见 App::new / tab_bar），
-/// 不再是「打开过才有、位置随拖动漂移」的东西。
+///
+/// settings_pos **已无意义**（设置不再是页签，见 `Tab` 的说明），恒回 0，只为
+/// 兼容 config::TabsState 里那个保留字段；返回值保留成元组是为了不动
+/// current_tabs_state 的调用形状。
 fn restore_coords(kinds: &[TabKind], current: usize) -> (usize, usize) {
-    let settings_pos = 1usize;
     let mut pre = 1usize; // 下一个「插入前」槽位（1 = Home 之后）
     let mut active = 0usize; // 0 = Home / 无匹配
     for (i, k) in kinds.iter().enumerate() {
         if i == current && *k != TabKind::Home {
-            active = if *k == TabKind::Settings {
-                settings_pos
-            } else if pre >= settings_pos {
-                pre + 1
-            } else {
-                pre
-            };
+            active = pre;
         }
         if *k == TabKind::Alive {
             pre += 1;
         }
     }
-    (active, settings_pos)
+    (active, 0)
 }
+
+/// 设置窗口（右下角「⚙ 设置」浮层）的尺寸。
+///
+/// 定宽 + 定高：设置页里全是表格/输入框/滑杆，宽度一随内容变，行内控件就会
+/// 跳动（滑杆会把整页撑宽，缩回来时输入框又换行）。高度用满内容区再减按钮带，
+/// 超出部分由内部 ScrollArea 滚——见 settings_window。
+struct SettingsWinSpec {
+    w: f32,
+    h: f32,
+}
+const SETTINGS_WIN: SettingsWinSpec = SettingsWinSpec { w: 720.0, h: 560.0 };
+
+/// 右下角「⚙ 设置」按钮与窗口边缘/状态栏之间的留白。按钮与默认窗口位置共用
+/// 这一份数字，两者才不会各算各的、互相压住。
+const SETTINGS_BTN_MARGIN: f32 = 10.0;
 
 /// 页签栏里页签内外的固定空隙（绘制与滚动量算共用一份数字，避免两处漂移）。
 const TAB_GAP: f32 = 4.0;
+
+/// 页签上的关闭按钮字形。
+///
+/// 旧版是 ×（U+00D7）：一条细线、宽度只有一个汉字的三分之一，在标题右侧几乎是
+/// 个笔画。换成 ❌（U+274C）——字形自带色块，一眼能看见也一眼能对准。
+const CLOSE_GLYPH: &str = "❌";
+
+/// 标题与 ❌ 之间固定垫的宽度（一个空格的观感）。
+///
+/// 它同时是「❌ 不贴着标题最后一个字」的间距与「关闭命中区左半边」的延伸：
+/// 贴着时想点关闭会点到标题（=切页）、想点标题会误关，两头都不舒服。
+const CLOSE_GAP: f32 = 4.0;
+
+/// ❌ 命中矩形在字形之外左右各外扩的宽度。
+///
+/// 命中率全靠它：❌ 只占一个字形宽，用鼠标尖去戳一个 14px 的方块，手一抖就落到
+/// 页签上变成切页。外扩到「字形 + 左右各 4px + 左边那一格空格」≈ 两倍宽。
+const CLOSE_HIT_PAD_X: f32 = 4.0;
+
+/// ❌ 命中矩形上下外扩的高度：撑满整个行高（页签只有一行，于是整块右端都能点）。
+const CLOSE_HIT_PAD_Y: f32 = 5.0;
 
 /// 页签区视口两端滚动按钮的槽宽（见 strip_scroll_btn / strip_btn_reserve）。
 ///
@@ -3876,10 +3920,12 @@ impl ClientApp {
         let saved_active = config.tabs.active;
         let mut app = Self {
             config,
-// 设置页签常驻：与首页一样是**页面**而不是会话，固定在下标 1（首页之后），
-            // 不靠任何按钮打开（页签栏上直接点）。
-            tabs: vec![Tab::Home, Tab::Settings],
+            // 设置不再是页签：页签数组里只有首页 + 会话，设置是右下角按钮 +
+            // 浮层窗口（见 settings_button / settings_window），启动时收起。
+            tabs: vec![Tab::Home],
             current: 0,
+            settings_open: false,
+            settings_win_pos: egui::Pos2::ZERO,
             screen: Screen::Main,
             selected_project: 0,
             settings_command,
@@ -3980,25 +4026,23 @@ search_query: String::new(),
                 cmd,
             });
         }
-        // 设置页签常驻：启动时已在 tabs[1]（见 App::new），这里只需要把**旧配置**
-        // 里的 active 搬到新坐标系上——老版本可能压根没开过设置页签，那时
-        // active 是按「首页 + 会话」数的，新坐标在中间多出一个下标 1 的设置页签
-        // （首页本身仍是 0，别把它也 +1 了）。
-        let saved_active = if saved_tabs.settings_open || saved_active == 0 {
+        // 坐标换算：**老配置**里的 active 可能是「曾在设置页签上」的位置，而设置
+        // 已经不是页签了，直接沿用会整体右移一格（落到隔壁会话上）。
+        //
+        // 规则：老版本只要出现过设置页签（settings_open 为 true，或 settings_pos
+        // 非 0），下标 1 就是它，active 落在 1 上就当作「停在设置页」→ 回到首页；
+        // 大于 1 的减一。新配置 settings_open 恒 false / settings_pos 恒 0，不做
+        // 任何换算（否则每重启一次就左移一格，越恢复越偏）。
+        let had_settings_tab = saved_tabs.settings_open || saved_tabs.settings_pos != 0;
+        let saved_active = if !had_settings_tab || saved_active == 0 {
             saved_active
+        } else if saved_active == 1 {
+            0 // 老配置停在设置页签上 → 设置收起了，落回首页
         } else {
-            saved_active.saturating_add(1)
+            saved_active - 1
         };
-        if !app.pending_restore.is_empty() {
-            // 注意：升级前的旧配置坐标含退出页签/设置页签偏移，首启可能落错
-            // 一格——旧值无法换算（配置没存退出标记），落错时切回正确页签后
-            // 第一次保存即写入 restore_coords 新格式，此后恢复正确（一次性）。
-            app.restore_active = Some(saved_active);
-        } else {
-            // 没有会话可恢复也要把激活页签落到设置/首页上（老配置的 active=0
-            // 恰好是首页，1 恰好是设置，仍成立）。
-            app.restore_active = Some(saved_active.min(app.tabs.len() - 1));
-        }
+        // 没有会话可恢复也要有个确定落点（首页或空，不越界）。
+        app.restore_active = Some(saved_active.min(app.tabs.len() - 1));
 
         // 每次启动自动检查一次更新。
         app.check_updates(true);
@@ -4022,14 +4066,14 @@ search_query: String::new(),
             .collect();
         let dirs: Vec<String> = active_sessions.iter().map(|s| s.dir.clone()).collect();
         let cmds: Vec<String> = active_sessions.iter().map(|s| s.cmd.clone()).collect();
-        // 设置页签常驻，落盘恒为 true（旧字段留着只为读老配置）。
-        let settings_open = true;
+        // 设置已不是页签：settings_open 旧字段落盘恒 false（留着只为读老配置，
+        // 且不能写 true——老版本按它去恢复「设置页签」）。
+        let settings_open = false;
         let kinds: Vec<TabKind> = self
             .tabs
             .iter()
             .map(|t| match t {
                 Tab::Home => TabKind::Home,
-                Tab::Settings => TabKind::Settings,
                 Tab::Placeholder { .. } => TabKind::Gone,
                 Tab::Session(s) if s.exited.load(Ordering::Acquire) => TabKind::Gone,
                 Tab::Session(_) => TabKind::Alive,
@@ -4095,7 +4139,7 @@ fn strip_geom_for_frame(
             let (title, has_close) = match tab {
                 Tab::Session(s) => (&s.title, true),
                 Tab::Placeholder { title } => (title, false),
-                _ => continue, // 首页/设置在固定区，不参与排布
+                _ => continue, // 首页在固定区（设置是右下角浮层，压根不在 tabs 里）
             };
             let w = match cache.get(title.as_str()) {
                 Some(&w) => w,
@@ -4114,26 +4158,52 @@ fn strip_geom_for_frame(
         strip_geom(&items, m)
     }
 
+    /// 打开设置窗口（右下角「⚙ 设置」按钮 / 状态栏「新版本」提示都走这里）。
+    ///
+    /// 不再切页签：设置是浮层窗口，底下的会话/首页**保持原样**、终端照旧在跑，
+    /// 关掉窗口就还在原来那页上（旧实现把设置做成常驻页签，一进去当前会话就
+    /// 不再是「当前页签」，✅ 判定与输入路由全跟着变）。
+    ///
+    /// 每次都重读一份设置快照：上次没保存完的半行输入（新增命令框 / 编辑框）
+    /// 不该挂到下一次打开。
     fn open_settings(&mut self) {
         self.settings_command = self.config.settings.tui_command.clone();
         self.settings_commands = self.config.settings.tui_commands.clone();
         self.settings_new_command.clear();
         self.settings_tool_dirs = self.config.settings.tool_paths.clone();
         self.settings_new_tool_dir.clear();
-// 设置页签常驻：只在万一被拉离下标 1 时拉回来（重建路径），正常恒为 idx == 1。
-        let idx = match self.tabs.iter().position(|t| matches!(t, Tab::Settings)) {
-            Some(i) => i,
+        self.settings_open = true;
+    }
+
+    /// 关掉设置窗口。会话一个都不动（它不是页签），只把焦点还给原先那页。
+    fn close_settings(&mut self) {
+        self.settings_open = false;
+        self.refresh_focus();
+        self.status = Some("已收起设置".to_string());
+    }
+
+    /// 本帧设置窗口的左上角：两种来源二选一。
+    ///
+    /// * 用户拖过（`settings.settings_win_pos` 有值）→ 用存下的位置；
+    /// * 没拖过 → 贴右下角（每帧现算，窗口缩放/最大化自动跟上）。
+    ///
+    /// 两种来源最后都夹进 `bounds`：缩小窗口、换显示器、拖到边外之后必须还
+    /// 看得见，绝不能算出窗口外的坐标让用户「打不开设置」。
+    fn settings_win_pos_of(&self, bounds: egui::Rect) -> egui::Pos2 {
+        let p = match self.config.settings.settings_win_pos {
+            Some([x, y]) => egui::pos2(x, y),
             None => {
-                self.tabs.insert(1.min(self.tabs.len()), Tab::Settings);
-                1
+                // 右下角：按钮所在的右下角减去窗口自己的尺寸（再让开按钮那一小块
+                // 与内边距，别压在按钮上）。
+                let sec = bounds.shrink(SETTINGS_BTN_MARGIN);
+                egui::pos2(sec.right(), sec.bottom()) - egui::vec2(SETTINGS_WIN.w, SETTINGS_WIN.h)
             }
         };
-        if idx != 1 {
-            let t = self.tabs.remove(idx);
-            self.tabs.insert(1, t);
-        }
-        self.current = 1;
-        self.term_focused = false;
+        // 至少留一条标题栏在视野里（拖出去一半也还能抓回来）。
+        egui::pos2(
+            p.x.clamp(bounds.left() + 40.0 - SETTINGS_WIN.w, bounds.right() - 120.0),
+            p.y.clamp(bounds.top(), bounds.bottom() - 40.0),
+        )
     }
 
     fn refresh_focus(&mut self) {
@@ -4569,8 +4639,8 @@ fn strip_geom_for_frame(
     }
 
     fn close_session(&mut self, idx: usize) {
-        // 首页（0）与设置页签（常驻 1）是页面不是会话，不可关闭。
-        if idx <= 1 || idx >= self.tabs.len() {
+        // 首页（0）是页面不是会话，不可关闭；其余都是会话页签。
+        if idx == 0 || idx >= self.tabs.len() {
             return;
         }
         // 将 child 和 master 都移到后台线程异步清理：
@@ -4599,12 +4669,11 @@ fn strip_geom_for_frame(
     }
 
     /// 会话页签拖动落位：把 from 移到「原索引空间」的插入点 target（1..=len）。
-    /// 0 是固定的首页，1 是常驻的设置页签，都不在可移动范围内。
+    /// 0 是固定的首页，不在可移动范围内（设置已不是页签，不再占位）。
 fn move_tab(&mut self, from: usize, target: usize) {
         let len = self.tabs.len();
-        // 固定区不参与重排：首页恒在 0，设置恒在 1（常驻）。落点不得插到它
-        // 前面/中间，否则设置页签会被拖离首页之后。
-        let fixed_end = 2;
+        // 固定区不参与重排：首页恒在 0。落点不得插到它前面。
+        let fixed_end = 1;
         if from < fixed_end || from >= len || target == 0 || target > len {
             return;
         }
@@ -5069,54 +5138,12 @@ s.last_reap_ms.store(now_ms, Ordering::Relaxed);
                 }
             }
 
-            // ── 固定区：设置页签（恒在首页之后，与首页完全同款）──
-            // 常驻左侧：设置是全局页面，滚走就找不着了，所以没有「设置按钮」——
-            // 它就是页签栏第二个，点一下就进去。
-            // 尺寸与首页一致：同一个 Frame / 同一份内边距 / 只有文字，没有状态图标
-            // 槽也没有 ×（常驻页签不可关）；标题同为「emoji + 2 汉字」，宽度自然相等。
-            // 不可拖动：位置固定（下标 1），能被拖走又会被拉回来，不如直接不响应。
-            if let Some(i) = self.tabs.iter().position(|t| matches!(t, Tab::Settings)) {
-                ui.add_space(4.0);
-                let selected = self.current == i;
-                // 与首页同序：Noop 占位 → 内容 → 设底色 → 挂交互层。
-                let bg_idx = ui.painter().add(egui::Shape::Noop);
-                let resp = egui::Frame::new()
-                    .corner_radius(4.0)
-                    .fill(Color32::TRANSPARENT)
-                    .inner_margin(tab_margin)
-                    .show(ui, |ui| {
-                        ui.add(
-                            if selected {
-                                egui::Label::new(RichText::new("⚙ 设置").strong())
-                            } else {
-                                egui::Label::new("⚙ 设置")
-                            }
-                            .selectable(false),
-                        )
-                    });
-                let rect = resp.response.rect;
-                // 只感 click：固定页签不参与重排、不响应拖动（同首页）。
-                let hit = ui.interact(rect, egui::Id::new("settings_tab"), egui::Sense::click());
-                // 只认指针点击：键盘回车不切页（同首页，见 tab_focus.rs）。
-                if hit.clicked_by(egui::PointerButton::Primary) && !selected {
-                    actions.push(TabAction::Activate(i));
-                }
-                let hovering = !selected
-                    && ui.ctx().pointer_interact_pos().is_some_and(|p| rect.contains(p));
-                    let bg = Self::tab_bg(sel_fill, selected, hovering, dark);
-                let block = rect.expand2(egui::vec2(5.0, 2.0));
-                ui.painter().set(bg_idx, egui::Shape::rect_filled(block, 0.0, bg));
-                if let Some(accent) = Self::tab_accent(dark, selected, block) {
-                    ui.painter().add(accent);
-                }
-                // 不进 tab_rects：拖动落位不许把会话插到设置页签前面/后面去。
-            }
 
-            // ── 会话页签区：页签太多时**只滚这一段**（滚轮/触控板，无滚动条）──
-            // 首页与设置常驻左侧；首页/设置**页面**上的滚轮也不归它（判定靠指针
-            // 是否落在本行矩形内）。不需要真的用 ScrollArea：它靠「测量一遍 + 裁剪
-            // 重画一遍」实现，而本函数每帧都在收集点击动作/拖动源，两遍会重复执行
-            // 副作用；它还自带一条滚动条，页签栏这么窄一行，没必要占地方。
+            // 首页常驻左侧，会话页签都在这段里滚；首页**页面**上的滚轮也不归它
+            // （判定靠指针是否落在本行矩形内）。不需要真的用 ScrollArea：它靠
+            // 「测量一遍 + 裁剪重画一遍」实现，而本函数每帧都在收集点击动作/
+            // 拖动源，两遍会重复执行副作用；它还自带一条滚动条，页签栏这么窄
+            // 一行，没必要占地方。
             // 这里改成：按量出来的宽度把布局起点左移 off，再按视口裁剪。
             let avail = ui.available_rect_before_wrap();
             let full_w = avail.width().max(0.0);
@@ -5235,9 +5262,6 @@ pad: tab_margin.left as f32 + tab_margin.right as f32,
             ui.set_clip_rect(view);
 
             for (i, tab) in self.tabs.iter().enumerate().skip(1) {
-                if matches!(tab, Tab::Settings) {
-                    continue; // 固定区已画
-                }
                 if let Tab::Session(s) = tab {
                     ui.add_space(TAB_GAP);
 // 状态图标：固定宽度单字符。
@@ -5282,13 +5306,21 @@ let icon = tab_icon_from_snap(
                             // 不至于把页签缩成一小条，文字与 × 挤在一起、点选/拖拽目标过小。
                             let min_width =
                                 ui.text_style_height(&egui::TextStyle::Body) * 4.0;
-                            // × 用 U+00D7（Latin-1）而不是 ✕ (U+2715)：后者在 egui 自带字体
-                            // 与系统 CJK 字体里都可能缺字形，导致关闭图标不显示。
+                            // 关闭按钮用 ❌（U+274C）而不是旧版那个又小又细的 ×（U+00D7）：
+                            // × 在页签名旁边就是一个小点，得瞄准了点才中。换成 ❌ 后
+                            // 字形本身就有色块。
+                            //
+                            // ❗ 命中率不只靠字形：❌ 前面**必须留一个空格**（见下面
+                            // pad_m 那段说明），而且帧内的命中判定用的是围绕 ❌ 放大过的
+                            // close_rect（不是字形 rect），这样点在 ❌ 边缘/前后几个像素
+                            // 也算关闭——「点了没反应」比「误关一个页签」更烦人，何况
+                            // 误关只是重开。
+                            //
                             // 点击判定靠帧内对该矩形做命中检查（见下方 clicked 分支）。
-                            // egui 横向布局无 flex：先量出标题与 × 的实际宽度，标题在槽内
-                            // 居中、× 右对齐——把差额拆成“标题左侧垫白”和“标题/× 之间垫白”
-                            // 两部分，等式让标题中心落在槽中心；差额小到撑不开中间空隙时全垫
-                            // 在左侧，正文与 × 紧邻（与自然宽标题行为一致）。
+                            // egui 横向布局无 flex：先量出标题与关闭按钮的实际宽度，标题在槽内
+                            // 居中、关闭按钮右对齐——把差额拆成“标题左侧垫白”和“标题/关闭
+                            // 按钮之间垫白”两部分，等式让标题中心落在槽中心；差额小到撑不开
+                            // 中间空隙时全垫在左侧，正文与关闭按钮紧邻（与自然宽标题行为一致）。
                             // slot_w/close_w 整帧已量好；title_w 走缓存（标题不变不排版）。
                             let title_w = *self.title_width_cache.entry(title.clone()).or_insert_with(|| {
                                 ui.ctx().fonts_mut(|f| {
@@ -5297,12 +5329,20 @@ let icon = tab_icon_from_snap(
                                         .x
                                 })
                             });
-let s = TAB_GAP;
+                            let s = TAB_GAP;
                             let icon_title_w = slot_w + s + title_w;
-                            let slack = (min_width - icon_title_w - s - close_w).max(0.0);
-                            let (pad_l, pad_m) = if slack > 0.0 && slack >= close_w + s {
-                                // 左右空隙对等：pad_l = pad_m + s + close_w → 标题居中。
-                                ((slack + close_w + s) / 2.0, (slack - close_w - s) / 2.0)
+                            // 关闭按钮前面那个空格：**命中率的一部分**，不是排版。
+                            // ❌ 是个实心方块字，紧贴标题时「标题最后一个字」与「关闭」
+                            // 只隔 s(4px)，想点关闭很容易先点到标题（=切页）；反过来想
+                            // 点标题也容易误关。垫一个空格（≈4px，且本来就该有的呼吸
+                            // 间距）让两者分开，配合下面放大过的 close_rect，边上一两个
+                            // 像素也算命中。
+                            let close_gap = s;
+                            let slack =
+                                (min_width - icon_title_w - close_gap - close_w).max(0.0);
+                            let (pad_l, pad_m) = if slack > 0.0 && slack >= close_w + close_gap {
+                                // 左右空隙对等：pad_l = pad_m + close_gap + close_w → 标题居中。
+                                ((slack + close_w + close_gap) / 2.0, (slack - close_w - close_gap) / 2.0)
                             } else if slack > 0.0 {
                                 (slack, 0.0)
                             } else {
@@ -5340,10 +5380,27 @@ let s = TAB_GAP;
                             if pad_m > 0.0 {
                                 ui.add_space(pad_m);
                             }
-                            (ui.add(egui::Label::new("×").selectable(false)).rect, ui.response())
+                            // ❗ 关闭按钮前**固定垫一个空格**：不能只靠上面算出来的
+                            // pad_m（标题够宽时 slack=0，pad_m 也是 0，❌ 就贴在标题
+                            // 最后一个字上）。这一格同时是「❌ 的左边距」与「命中区」
+                            // 的左半边，见下面 close_rect 的放大。
+                            ui.add_space(CLOSE_GAP);
+                            (
+                                ui.add(egui::Label::new(CLOSE_GLYPH).selectable(false)).rect,
+                                ui.response(),
+                            )
                         })
 .inner;
                     let rect = frame_resp.rect;
+                    // ── 关闭按钮的命中矩形：比 ❌ 字形**大一圈** ──
+                    // 只命中字形本身时的实况：❌ 只有一行字那么高（~14px），点在上沿/
+                    // 下沿几个像素就落到页签上变成「切页」，看着就是「点了 ❌ 没反应」。
+                    // 往上下各撑大半个行高、往左右各撑一点（左边连同上面那个空格），
+                    // 于是整块页签右下角都算关闭——不越出页签本身，相邻页签不会被抢走。
+                    let close_rect = close_rect.expand2(egui::vec2(
+                        CLOSE_HIT_PAD_X,
+                        CLOSE_HIT_PAD_Y,
+                    )).intersect(rect);
                     // 滚出可见区的页签：整段跳过（绘制本来就被裁掉，但**交互不会**——
                     // 不跳过就变成点右侧空白处命中一个看不见的页签）。
                     if !view.intersects(rect) {
@@ -5560,19 +5617,12 @@ let s = TAB_GAP;
         for action in actions {
             match action {
                 TabAction::Activate(i) => {
-                    if matches!(self.tabs.get(i), Some(Tab::Settings)) {
-                        // 设置页签常驻：点它 = 打开设置页。走 open_settings 是为了
-                        // 清掉上次没保存完的输入缓冲（新增框/编辑框的半截内容），
-                        // 否则关掉设置页再进来还挂着上次那半行。
-                        self.open_settings();
-                    } else {
-// 点击页签 → 视为已看过：清 ✅ + 抑制「任务完成」通知。
-                        if let Some(Tab::Session(s)) = self.tabs.get_mut(i) {
-                            s.has_been_viewed.store(true, Ordering::Relaxed);
-                        }
-                        self.current = i;
-                        self.refresh_focus();
+                    // 点击页签 → 视为已看过：清 ✅ + 抑制「任务完成」通知。
+                    if let Some(Tab::Session(s)) = self.tabs.get_mut(i) {
+                        s.has_been_viewed.store(true, Ordering::Relaxed);
                     }
+                    self.current = i;
+                    self.refresh_focus();
                 }
                 TabAction::Close(i) => self.close_session(i),
                 TabAction::OpenDir(i) => {
@@ -5758,7 +5808,7 @@ let s = TAB_GAP;
                         ui_gray(ui),
                     ),
                     _ => (
-"选择项目 → 启动（内嵌终端页签）   |   添加 / 重命名 / 改路径 / 删除   |   检查更新 / 深浅色 / 打开目录：页签栏「⚙ 设置」"
+"选择项目 → 启动（内嵌终端页签）   |   添加 / 重命名 / 改路径 / 删除   |   检查更新 / 深浅色 / 打开目录：右下角「⚙ 设置」"
                             .to_string(),
                         ui_gray(ui),
                     ),
@@ -6294,9 +6344,37 @@ match self.config.settings.project_sort {
         // 悬停激活窗口（焦点随鼠标）——30 FPS 输出中实测失效、10 FPS 正常（见
         // 921f062/0ae5904）。根治 = 去掉可调档，锁死 10 FPS（BUSY_FRAME_MS）。
         ui.add_space(12.0);
-        ui.label(RichText::new("🔄 = 正在运行（有输出内容 / 进程树在计算），✅ = 输出结束待查看（切到该页签、或在页签内点击/滚动/输入即消失；失焦/回焦不算「看过」，窗口没回到屏幕前就不会被抹掉；TUI 静止等输入不算，显示空），空 = 等待输入或空闲，❌ = 已退出。\n🔄 以是否有输出内容为准，按键/粘贴等人工输入不算输出、保持空不误判 🔄；零输出页签不闪 🔄；✅ 稳定停留 2 秒后，满足「静默 ≥10s + 有实质输出 + 未查看 + 非当前页签/窗口失焦」才按上面「🔔 提醒」里开的开关提醒（系统通知 / 任务栏闪烁，默认都开）。\n快捷键：Ctrl+Tab 循环切换到下一个页签，Ctrl+Shift+Tab 切换到上一个（只在项目页签之间循环，不会切到首页/设置页）。").weak());
-ui.add_space(12.0);
+        // 窗口自己的操作方法（这是浮层，不是页签，没人会「先猜一下」怎么挪）。
+        self.window_section_ui(ui);
+        ui.separator();
+        ui.add_space(6.0);
         ui.label(RichText::new(format!("配置文件: {}", self.config_path.display())).weak());
+    }
+
+    /// 设置窗口「🪟 本窗口」区：说明怎么关、怎么挪、怎么恢复默认位置。
+    ///
+    /// 单独画出来是因为浮层的操作没有页签那么自明（旧版它是常驻页签，关不掉也
+    /// 拖不动，用户没有任何可期待的操作；现在能关能拖了，得告诉人去哪儿关）。
+    fn window_section_ui(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("🪟 本窗口").strong());
+        ui.label(
+            RichText::new(
+                "拖动顶部标题栏「⚙ 设置」可移动本窗口，点标题栏右端的 ❌ 或右下角\
+                 「⚙ 设置」按钮即可收起；位置会自动记住。",
+            )
+            .weak()
+            .small(),
+        );
+        let reset = ui
+            .button("⌂ 回到右下角")
+            .on_hover_text("把设置窗口放回默认位置（右下角），并随窗口缩放自动跟随");
+        if reset.clicked() {
+            // 清掉存档 = 回到「跟着右下角走」的默认行为；本帧的缓存位置也立刻
+            // 按新规则重算，免得画面闪一下再跳回来。
+            self.config.settings.settings_win_pos = None;
+            self.settings_win_pos = self.settings_win_pos_of(ui.max_rect());
+            self.save_config("设置窗口已回到右下角".to_string());
+        }
     }
 
     /// 设置页的「提醒」区：系统通知 / 任务栏闪烁两个开关 + 规则说明。
@@ -8813,7 +8891,7 @@ let app_fg = crate::app_is_foreground(self.titlebar_hwnd, ctx.input(|i| i.focuse
             }
             // 全部恢复 spawn 完成后（若尚无恢复任务则 skips 返回），按保存序一次性
             // 追加到页签，再应用上次激活页签。避免逐条插入的越界/顺序错乱。
-            // 设置页签已在构造期就位于 tabs[1]（常驻），这里无需再插。
+            // 恢复的会话接在首页之后（tabs[0] 恒为首页，设置不再是页签）。
 if self.spawning.is_empty() && !self.restore_slots.is_empty() {
                 let slots = std::mem::take(&mut self.restore_slots);
                 let mut restored = 0usize;
@@ -8833,7 +8911,7 @@ if self.spawning.is_empty() && !self.restore_slots.is_empty() {
                     self.status = Some(format!("已恢复上次的 {restored} 个终端页签"));
                 }
             }
-            // 应用上次激活页签。与恢复 spawn 解耦：上次停在设置页（无会话）时也要
+            // 应用上次激活页签。与恢复 spawn 解耦：上次停在首页（无会话）时也要
             // 落位，故不挂在上面的 restore_slots 块里。
             if self.spawning.is_empty() {
                 if let Some(active) = self.restore_active.take() {
@@ -8918,24 +8996,194 @@ if self.spawning.is_empty() && !self.restore_slots.is_empty() {
                         });
                     });
                 }
-                Some(Tab::Settings) => {
-                    // 设置页很长（启动命令列表 / 工具更新路径 / 供应商配置三个页签 /
-                    // 深浅主题…），窗口不够高时下面的区块直接被面板裁掉且滚不到。
-                    // 整页套竖向滚动区：auto_shrink([false,false]) = 宽高都撑满可用
-                    // 空间（否则内容短时滚动区会缩成内容宽，右侧留白）。
-                    egui::ScrollArea::vertical()
-                        .id_salt("settings_scroll")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| self.settings_ui(ui));
-                }
                 _ => {
+                    // 设置不再占着一整页（它是右下角浮层），首页照常画在底下：
+                    // 开着设置窗口时左栏的项目列表仍然能看、能选。
                     self.home_ui(ui);
                 }
             }
         });
 
+        // 浮层两件套放在中央面板**之后**：它们要盖在内容（含终端）之上，且要
+        // 用到本帧的窗口坐标，所以放在这里、不放进任何面板。
+        self.settings_button(ui);
+        self.settings_window(ui);
+
         self.input_dialog(ui);
         self.confirm_dialog(ui);
+    }
+}
+
+impl ClientApp {
+    // ── 设置：右下角按钮 + 可关可拖的浮层窗口 ──────────────────────────────
+    //
+    // 旧版把设置做成页签栏里常驻的「⚙ 设置」页签（首页右边、不可关不可拖）。
+    // 现方案：一颗固定在右下角的「⚙ 设置」按钮，点开一个浮层窗口。窗口
+    // ① 不默认打开（启动时收起）② 有 ❌（整条标题栏 = 拖动把手）
+    // ③ 拖过就记住位置（config.settings.settings_win_pos），没拖过就贴右下角。
+    //
+    // 为什么用 Area 而不是 egui::Window：Window 自带标题栏/折叠箭头/阴影一整套，
+    // 尺寸还会被内容撑开（本页全是表格与滑杆，宽度一抖整页就跳）；Area + 自己画的
+    // 标题栏只有「拖动 + ❌ + 一块矩形」，行为完全可控。
+
+    /// 右下角的「⚙ 设置」按钮（常驻，永远在内容之上）。
+    ///
+    /// 位置贴着内容区右下角再让开状态栏那个面板：ui() 里的 ui.max_rect() 已经是
+    /// 「除去顶部页签栏与底部状态栏」的内容区，直接量它即可，不用硬编码状态栏
+    /// 高度（改状态栏高度时按钮跟着走）。
+    ///
+    /// 注意它和设置窗口**共用右下角**：窗口默认位置正是「右下角减去窗口尺寸」，
+    /// 于是窗口一打开就正好盖住这颗按钮——这是故意的：窗口开着时按钮的用途变成
+    /// 「收起来」，被盖住就不该抢点击。收起后按钮露出来，位置本身没变（不会
+    /// 在界面上跳来跳去）。
+    fn settings_button(&mut self, ui: &mut egui::Ui) {
+        let bounds = ui.max_rect();
+        let pos = bounds.right_bottom() - egui::vec2(SETTINGS_BTN_MARGIN, SETTINGS_BTN_MARGIN);
+        egui::Area::new(egui::Id::new("settings_btn"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            // 以右下角为锚：按钮尺寸随字体/DPI 变化时右下角不动，不会顶出窗口。
+            .pivot(egui::Align2::RIGHT_BOTTOM)
+            .interactable(true)
+            .constrain(true)
+            .show(ui.ctx(), |ui| {
+                let resp = ui.add(
+                    egui::Button::new(RichText::new("⚙ 设置").strong())
+                        .min_size(egui::vec2(72.0, 26.0))
+                        .corner_radius(6.0),
+                );
+                let resp = resp
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text("打开/收起设置（拖标题栏可移动，点 ❌ 关闭）");
+                if resp.clicked_by(egui::PointerButton::Primary) {
+                    // 一个按钮两种用途：关着就开、开着就收（开着时它是「回到内容」
+                    // 的入口——浮层压住右下角时，用户第一反应也是再点一下它）。
+                    if self.settings_open {
+                        self.close_settings();
+                    } else {
+                        self.open_settings();
+                    }
+                }
+            });
+    }
+
+    /// 设置浮层窗口本体（关闭状态下**什么都不画**：不占位、不吃点击）。
+    fn settings_window(&mut self, ui: &mut egui::Ui) {
+        if !self.settings_open {
+            return;
+        }
+        let bounds = ui.max_rect();
+        // 本帧起点：没拖过 = 贴右下角（跟随窗口缩放），拖过 = 存下的位置（但夹回
+        // 窗口内）。位置只在这里算一次，标题栏拖动改的是 self.settings_win_pos。
+        let mut pos = self.settings_win_pos_of(bounds);
+        // 尺寸：定宽，高度取「内容区高度 - 留白 - 按钮带」，再夹进 [240, 规格高]：
+        // 小窗口下不能把设置页挤成一条缝（内部是 ScrollArea，放不下就滚）。
+        //
+        // 宽度还有个下限 320：设置页里的滑杆/表格/输入框都是按几百像素排的，
+        // 再窄就只剩「控件互相挤」，不如让窗口探出可视区（有 constrain 夹回来）
+        // ——实际能不能窄到这个数由窗口最小宽度（760）兜住，这行只防极端 DPI。
+        let h = (bounds.height() - SETTINGS_BTN_MARGIN * 2.0 - 30.0).clamp(240.0, SETTINGS_WIN.h);
+        let w = SETTINGS_WIN.w.min(bounds.width() - 24.0).max(320.0);
+        let mut closed = false;
+        let area = egui::Area::new(egui::Id::new("settings_win"))
+            .order(egui::Order::Foreground)
+            .current_pos(pos)
+            .interactable(true)
+            .constrain(true);
+        let out = area.show(ui.ctx(), |ui| {
+            ui.set_width(w);
+            ui.set_height(h);
+            egui::Frame::new()
+                .fill(ui.visuals().window_fill)
+                .stroke(ui.visuals().window_stroke)
+                .corner_radius(8.0)
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    // ── 标题栏：整条都是拖动把手，右端一颗 ❌ ──
+                    // 两个互不重叠的交互区：先注册 ❌（右端 24px），再注册拖动区
+                    // （左端到 ❌ 左边）。指针在 ❌ 上时拖动区拿不到 hover，也就
+                    // 不会一边想关一边把窗口拖走。
+                    let bar_h = 24.0;
+                    let (bar_rect, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), bar_h),
+                        egui::Sense::hover(),
+                    );
+                    let close_r = egui::Rect::from_min_max(
+                        egui::pos2(bar_rect.right() - 24.0, bar_rect.top()),
+                        bar_rect.right_bottom(),
+                    );
+                    let close_resp = ui.interact(
+                        close_r,
+                        egui::Id::new("settings_win_close"),
+                        egui::Sense::click(),
+                    );
+                    if close_resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        ui.painter().rect_filled(
+                            close_r.expand(-4.0),
+                            4.0,
+                            ui.visuals().widgets.hovered.bg_fill,
+                        );
+                    }
+                    if close_resp.clicked_by(egui::PointerButton::Primary) {
+                        closed = true;
+                    }
+                    ui.painter().text(
+                        close_r.center(),
+                        egui::Align2::CENTER_CENTER,
+                        CLOSE_GLYPH,
+                        egui::TextStyle::Body.resolve(ui.style()),
+                        ui.visuals().strong_text_color(),
+                    );
+                    let drag_rect = egui::Rect::from_min_max(
+                        bar_rect.min,
+                        egui::pos2(close_r.left(), bar_rect.bottom()),
+                    );
+                    let drag_resp = ui.interact(
+                        drag_rect,
+                        egui::Id::new("settings_win_drag"),
+                        egui::Sense::click_and_drag(),
+                    );
+                    if drag_resp.hovered() || drag_resp.dragged() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                    }
+                    if drag_resp.dragged() {
+                        // 拖动：把起点改成「本帧起点 + 本次鼠标位移」，并立刻钉成固定
+                        // 值——从这一刻起它不再跟窗口缩放漂，符合用户预期。
+                        pos += drag_resp.drag_delta();
+                        self.settings_win_pos = pos;
+                        self.config.settings.settings_win_pos = Some([pos.x, pos.y]);
+                    }
+                    ui.painter().text(
+                        drag_rect.left_center() + egui::vec2(2.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        "⚙ 设置",
+                        egui::TextStyle::Body.resolve(ui.style()),
+                        ui.visuals().strong_text_color(),
+                    );
+                    ui.add_space(4.0);
+                    // ── 设置页正文 ──
+                    // 很长（启动命令列表 / 工具更新路径 / 供应商配置三个页签 /
+                    // 深浅主题…），固定高度里放不下就自己滚：auto_shrink([false,false])
+                    // = 宽高都撑满，内容短时也不会缩成一条、右侧不留白。
+                    egui::ScrollArea::vertical()
+                        .id_salt("settings_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| self.settings_ui(ui));
+                });
+        });
+        // Area 会把位置夹进窗口并取整：记下这一帧的真实落点，下次从这里出发。
+        self.settings_win_pos = out.response.rect.min;
+        // 拖出可见区之后兜底：窗口缩小/换显示器把位置夹回来后**落盘**一次，
+        // 否则下次仍是那个够不着的老坐标。只在真被夹动时写，别每帧写盘。
+        if let Some([x, y]) = self.config.settings.settings_win_pos
+            && ((x - pos.x).abs() > 0.5 || (y - pos.y).abs() > 0.5)
+        {
+            self.config.settings.settings_win_pos = Some([pos.x, pos.y]);
+        }
+        if closed || out.response.should_close() {
+            self.close_settings();
+        }
     }
 }
 #[cfg(test)]
@@ -9525,65 +9773,56 @@ mod settings_accordion_tests {
 mod restore_coords_tests {
     use super::{
         offset_to_show, restore_coords, strip_geom, strip_offset, tab_cycle_target, StripMetrics,
-        Tab, TabKind,
+        Tab, TabKind, CLOSE_GAP, CLOSE_GLYPH, CLOSE_HIT_PAD_X, CLOSE_HIT_PAD_Y, SETTINGS_BTN_MARGIN,
+        SETTINGS_WIN,
     };
+    use eframe::egui;
 
-    /// 回归：Ctrl+(Shift+)Tab 只在页签之间循环，不得落到首页 / 设置页。
+    /// 回归：Ctrl+(Shift+)Tab 只在页签之间循环，不得落到首页。
     ///
     /// 旧实现是 `(current ± 1) % tabs.len()`，候选集里混进了 `Home`（下标 0）
-    /// 和 `Settings`（末尾），于是「从项目 A 按 Ctrl+Tab」直接回到首页，
-    /// 再按又进设置——两个页面都不是页签，想回项目得连按几下，且极易在
-    /// 首页/设置之间来回弹。设置页里还嵌着模型配置等大量控件，一进去
-    /// 手感就变了。
+    /// 和 `Settings`（当时是常驻页签），于是「从项目 A 按 Ctrl+Tab」直接
+    /// 回到首页。设置现在已经不是页签（右下角浮层，见 settings_button），
+    /// 于是候选集只剩会话/占位页签，首页仍必须排除在外。
     #[test]
-fn tab_cycle_never_lands_on_home_or_settings() {
-        // 真实布局：Home 在 0、Settings 固定在 1，其余是会话/占位页签。
-        let tabs = vec![
-            Tab::Home,
-            Tab::Settings,
-            Tab::Placeholder { title: "A 重启中".into() },
-        ];
-        // 首页 → 前进进页签区第一个，后退进最后一个（都不是首页/设置）
-        assert_eq!(tab_cycle_target(&tabs, 0, true), Some(2));
-        assert_eq!(tab_cycle_target(&tabs, 0, false), Some(2));
-        // 在页签区里循环：2 → 2（只有一个候选，原地不动），且绝不去 0/1
-        assert_eq!(tab_cycle_target(&tabs, 2, true), Some(2));
-        assert_eq!(tab_cycle_target(&tabs, 2, false), Some(2));
-        // 设置页 → 同样进页签区
-        assert_eq!(tab_cycle_target(&tabs, 1, true), Some(2));
-        assert_eq!(tab_cycle_target(&tabs, 1, false), Some(2));
+    fn tab_cycle_never_lands_on_home() {
+        // 真实布局：Home 在 0，其余是会话/占位页签。
+        let tabs = vec![Tab::Home, Tab::Placeholder { title: "A 重启中".into() }];
+        // 首页 → 前进进页签区第一个，后退进最后一个（都不是首页）
+        assert_eq!(tab_cycle_target(&tabs, 0, true), Some(1));
+        assert_eq!(tab_cycle_target(&tabs, 0, false), Some(1));
+        // 在页签区里循环：只有它一个候选，原地不动，且绝不去 0
+        assert_eq!(tab_cycle_target(&tabs, 1, true), Some(1));
+        assert_eq!(tab_cycle_target(&tabs, 1, false), Some(1));
 
-        // 多个页签：在**页签之间**环回，不经过首页/设置
+        // 多个页签：在**页签之间**环回，不经过首页
         let tabs = vec![
             Tab::Home,
-            Tab::Settings,
             Tab::Placeholder { title: "A".into() },
             Tab::Placeholder { title: "B".into() },
             Tab::Placeholder { title: "C".into() },
         ];
+        assert_eq!(tab_cycle_target(&tabs, 1, true), Some(2));
         assert_eq!(tab_cycle_target(&tabs, 2, true), Some(3));
-        assert_eq!(tab_cycle_target(&tabs, 3, true), Some(4));
-        assert_eq!(tab_cycle_target(&tabs, 4, true), Some(2), "末尾要回卷到第一个页签，而不是设置页");
-        assert_eq!(tab_cycle_target(&tabs, 2, false), Some(4), "后退回卷也不落设置页");
-        assert_eq!(tab_cycle_target(&tabs, 4, false), Some(3));
+        assert_eq!(tab_cycle_target(&tabs, 3, true), Some(1), "末尾要回卷到第一个页签，而不是首页");
+        assert_eq!(tab_cycle_target(&tabs, 1, false), Some(3), "后退回卷也不落首页");
+        assert_eq!(tab_cycle_target(&tabs, 3, false), Some(2));
 
-        // 满页遍历一圈，一次都不许出现 0（首页）或 1（设置）
+        // 满页遍历一圈，一次都不许出现 0（首页）
         let mut cur = 0usize;
         for _ in 0..12 {
             cur = tab_cycle_target(&tabs, cur, true).unwrap();
-            assert!((2..=4).contains(&cur), "Ctrl+Tab 落到了非页签下标 {cur}");
+            assert!((1..=3).contains(&cur), "Ctrl+Tab 落到了非页签下标 {cur}");
         }
     }
 
-/// 没有项目页签时（只有首页 + 设置）→ 按键不做事，不能 panic 也不能乱跳。
+    /// 没有项目页签时（只剩首页；设置是浮层不是页签）→ 按键不做事，不能
+    /// panic 也不能乱跳。
     #[test]
     fn tab_cycle_noop_without_session_tabs() {
         let tabs = vec![Tab::Home];
         assert_eq!(tab_cycle_target(&tabs, 0, true), None);
         assert_eq!(tab_cycle_target(&tabs, 0, false), None);
-        let tabs = vec![Tab::Home, Tab::Settings];
-        assert_eq!(tab_cycle_target(&tabs, 0, true), None);
-        assert_eq!(tab_cycle_target(&tabs, 1, false), None);
         // 越界的 current（理论上不会出现）也不许 panic
         assert_eq!(tab_cycle_target(&tabs, 99, true), None);
     }
@@ -9638,20 +9877,18 @@ fn tab_cycle_never_lands_on_home_or_settings() {
     }
 
     #[test]
-fn restore_indices_skip_exited_and_settings() {
+    fn restore_indices_skip_exited_tabs() {
         use TabKind::*;
-        // settings_pos 恒为 1：设置页签**常驻**在首页之后（位置不持久化，也不可拖）。
-        // 恢复数组 = [Home, Settings, B, D]（A 已退出不恢复）。
-        let kinds = [Home, Settings, Gone, Alive, Alive];
-        assert_eq!(restore_coords(&kinds, 3), (2, 1)); // B → 2
-        assert_eq!(restore_coords(&kinds, 4), (3, 1)); // D → 3
-assert_eq!(restore_coords(&kinds, 1), (1, 1)); // Settings 自身 → 1
-        assert_eq!(restore_coords(&kinds, 2), (2, 1)); // 已退出 → 邻位（正好是 B）
-        assert_eq!(restore_coords(&kinds, 0), (0, 1)); // Home → 0
-        // 只有设置页签、没开过项目：坐标仍然是 [Home, Settings]。
-        let kinds = [Home, Settings];
-        assert_eq!(restore_coords(&kinds, 0), (0, 1));
-        assert_eq!(restore_coords(&kinds, 1), (1, 1));
+        // 设置已不是页签：恢复数组 = [Home, B, D]（A 已退出不恢复），
+        // 第二个返回值（旧的 settings_pos）恒为 0，只为兼容配置字段。
+        let kinds = [Home, Gone, Alive, Alive];
+        assert_eq!(restore_coords(&kinds, 2), (1, 0)); // B → 1
+        assert_eq!(restore_coords(&kinds, 3), (2, 0)); // D → 2
+        assert_eq!(restore_coords(&kinds, 1), (1, 0)); // 已退出 → 邻位（正好是 B）
+        assert_eq!(restore_coords(&kinds, 0), (0, 0)); // Home → 0
+        // 没开过项目：坐标就是 [Home]。
+        let kinds = [Home];
+        assert_eq!(restore_coords(&kinds, 0), (0, 0));
     }
 
     /// 回归：**滚轮拨得动页签条**（此前的 bug）。
@@ -9707,6 +9944,154 @@ fn wheel_scrolls_even_when_active_tab_is_out_of_view() {
         let (shown_last, _) =
             strip_offset(off, 0.0, true, view_w, g.content_w, Some((x_last, w)));
         assert_eq!(shown_last, g.content_w - view_w, "末尾页签应贴右缘");
+    }
+
+    // ── 设置浮层窗口（右下角按钮 + 可关闭/可拖动）──────────────────────────
+
+    /// 没拖过 → 贴右下角；且不压住页签栏/状态栏之外的东西。
+    ///
+    /// 旧版设置是常驻页签（不可关不可拖），位置这一路根本不存在——这条测试
+    /// 钉的是「默认落点」：窗口右上角必须落在内容区右下角以内，否则一打开
+    /// 就有一截在窗口外，用户得先找窗口。
+    #[test]
+    fn settings_window_defaults_to_bottom_right() {
+        let app = settings_win_app(None);
+        let bounds = egui::Rect::from_min_size(egui::pos2(0.0, 30.0), egui::vec2(1000.0, 700.0));
+        let p = app.settings_win_pos_of(bounds);
+        let win = egui::Rect::from_min_size(p, egui::vec2(SETTINGS_WIN.w, SETTINGS_WIN.h));
+        assert!(
+            bounds.contains_rect(win),
+            "默认位置必须整窗可见（win={win:?} bounds={bounds:?}）"
+        );
+        // 右下角 = 让开一个按钮留白
+        assert!((win.right() - (bounds.right() - SETTINGS_BTN_MARGIN)).abs() < 0.5);
+        assert!((win.bottom() - (bounds.bottom() - SETTINGS_BTN_MARGIN)).abs() < 0.5);
+    }
+
+    /// 拖过 → 用存下的位置；但窗口缩到装不下时必须夹回可见范围（否则用户
+    /// 下次打开设置「什么都没弹出来」）。
+    #[test]
+    fn settings_window_keeps_dragged_pos_but_stays_visible() {
+        let app = settings_win_app(Some([120.0, 200.0]));
+        let bounds = egui::Rect::from_min_size(egui::pos2(0.0, 30.0), egui::vec2(1000.0, 700.0));
+        assert_eq!(app.settings_win_pos_of(bounds), egui::pos2(120.0, 200.0));
+
+        // 窗口缩到 400×300：老位置在窗口外 → 夹回「至少露出标题栏」。
+        let small = egui::Rect::from_min_size(egui::pos2(0.0, 30.0), egui::vec2(400.0, 300.0));
+        let p = app.settings_win_pos_of(small);
+        assert!(p.x <= small.right() - 120.0, "右端至少留一条标题栏（x={}）", p.x);
+        assert!(p.y <= small.bottom() - 40.0, "底端至少留一条标题栏（y={}）", p.y);
+        // 也不能夹到彻底看不见（左/上溢出的上限是「窗口宽度 - 40」）。
+        assert!(p.x >= small.left() + 40.0 - SETTINGS_WIN.w);
+        assert!(p.y >= small.top());
+    }
+
+    /// 页签关闭按钮：❌ 前固定留一格空格，且命中区比字形大。
+    ///
+    /// 用户原话：「页签后的 x 改 ❌ 增大点击命中率 注意左侧有个空格」——两个点
+    /// 缺一不可：字形换成 ❌ 只是「看得见」，命中区放大才是「点得中」；左边那格
+    /// 空格防止 ❌ 贴在标题最后一个字上（想点关闭点到标题 = 切页，反之误关）。
+    #[test]
+    fn close_button_has_a_space_and_a_bigger_hit_area() {
+        assert_eq!(CLOSE_GLYPH, "❌");
+        // 排版常量本身就是常量断言，写进 const 块让编译期就钉住（clippy 也会
+        // 提示「这个断言值是常量」——搬进 const 块正是它建议的做法）。
+        const { assert!(CLOSE_GAP > 0.0, "❌ 左边必须有间距") };
+        const { assert!(CLOSE_HIT_PAD_X > 0.0 && CLOSE_HIT_PAD_Y > 0.0, "命中区必须外扩") };
+        // 外扩后的命中区宽度 = 字形 + 左右各一份 + 左边那格空格。❌ 本身就有
+        // 一个汉字宽（emoji 字形 ≈ 行高，比旧 × 那半个字宽得多），所以不必强求
+        // 「两倍」——两条一起看：总宽 ≥ 24px，且 ≥ 字形的 1.6 倍。
+        const {
+            let glyph_w = 14.0;
+            assert!(glyph_w + CLOSE_HIT_PAD_X * 2.0 + CLOSE_GAP >= 24.0, "命中区太窄");
+            assert!(
+                glyph_w + CLOSE_HIT_PAD_X * 2.0 + CLOSE_GAP >= glyph_w * 1.6,
+                "命中区应当明显大于字形"
+            );
+            // 上下也要撑开：页签只有一行，命中区高度 = 行高 + 上下各一份。
+            let row_h = 14.0;
+            assert!(row_h + CLOSE_HIT_PAD_Y * 2.0 >= 24.0, "命中区高度太矮");
+        }
+    }
+
+    /// 造一个只用来算位置的最小 ClientApp。
+    fn settings_win_app(pos: Option<[f32; 2]>) -> super::ClientApp {
+        let mut config = crate::config::Config::default();
+        config.settings.settings_win_pos = pos;
+        super::ClientApp {
+            config,
+            tabs: vec![Tab::Home],
+            current: 0,
+            settings_open: false,
+            settings_win_pos: egui::Pos2::ZERO,
+            screen: super::Screen::Main,
+            selected_project: 0,
+            settings_command: String::new(),
+            settings_commands: Vec::new(),
+            settings_new_command: String::new(),
+            settings_edit_idx: None,
+            settings_edit_buffer: String::new(),
+            settings_tool_dirs: Vec::new(),
+            settings_new_tool_dir: String::new(),
+            status: None,
+            config_path: std::path::PathBuf::new(),
+            term_focused: false,
+            update_latest: None,
+            check_tx: std::sync::mpsc::channel().0,
+            update_rx: std::sync::mpsc::channel().1,
+            download_progress_rx: None,
+            dl_progress: None,
+            downloading: false,
+            cancel_download: Default::default(),
+            update_done: false,
+            update_final: None,
+            tools: Vec::new(),
+            tool_tx: std::sync::mpsc::channel().0,
+            tool_rx: std::sync::mpsc::channel().1,
+            tool_cancel: Vec::new(),
+            input: None,
+            confirm: None,
+            redraw_tx: std::sync::mpsc::sync_channel(1).0,
+            theme_settle_at: None,
+            drag_tab: None,
+            drag_project: None,
+            drag_command: None,
+            pending_launch: Vec::new(),
+            spawning: Vec::new(),
+            spawn_rx: None,
+            pending_restore: Vec::new(),
+            restore_active: None,
+            tab_scroll_x: 0.0,
+            tab_scroll_follow: true,
+            tab_scroll_follow_at: 0,
+            tab_scroll_view_w: -1.0,
+            restore_slots: Vec::new(),
+            last_term_size: (80, 24),
+            titlebar_hwnd: 0,
+            last_theme_dark: true,
+            titlebar_restore_at: None,
+            last_config_save: std::time::Instant::now(),
+            last_update_check: std::time::Instant::now(),
+            config_save_failed: false,
+            ctx: egui::Context::default(),
+            dir_exists_cache: Default::default(),
+            title_width_cache: Default::default(),
+            tab_metrics: None,
+            pi_models: Default::default(),
+            omp_models: Default::default(),
+            opencode_models: Default::default(),
+            opencode_load_err: None,
+            opencode_default_model: String::new(),
+            model_settings_tab: 0,
+            open_settings_sec: None,
+            settings_sec_loaded: false,
+            provider_name_edit: None,
+            model_num_edit: None,
+            bg_frame: 0,
+            search_query: String::new(),
+            pending_relaunch: Vec::new(),
+            wheel: Default::default(),
+        }
     }
 }
 

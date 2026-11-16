@@ -127,7 +127,10 @@ pub fn tui_command_key(cmd: &str) -> String {
 }
 
 /// 程序设置。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// 注意：这里**不能** derive Eq —— \`settings_win_pos\` 是 f32 坐标（设置窗口
+/// 位置），f32 没有 Eq。相等性只在测试里用来比对落盘/读回，PartialEq 足够。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Settings {
     /// 已配置的 TUI 命令列表。
     #[serde(default)]
@@ -170,6 +173,16 @@ pub struct Settings {
     /// 调大 = 少谎报完成、✅ 更晚亮；调小 = ✅ 更快亮、更易误判。
     #[serde(default = "default_done_quiet_ms")]
     pub done_quiet_ms: u64,
+
+    /// 设置窗口（右下角「⚙ 设置」弹层）左上角位置（窗口坐标，左上角原点）。
+    ///
+    /// None = 从没拖过：每帧按「右下角」现算（窗口缩放/最大化时自动跟着走）。
+    /// Some = 用户自己拖过，就钉在那儿不跟窗口走（跟了等于每次改窗口大小都把
+    /// 用户摆好的位置冲掉）；再怎么拖都会夹回可视区，缩小窗口/换显示器后被
+    /// 夹动过就顺手落盘。想回默认位置：设置页「🪟 本窗口 → ⌂ 回到右下角」
+    /// （把它清回 None）。
+    #[serde(default)]
+    pub settings_win_pos: Option<[f32; 2]>,
 }
 
 /// 首页项目列表排序模式。升/降序仅作用于显示层（按名称首字），不修改
@@ -203,6 +216,7 @@ tool_paths: Vec::new(),
             notify_flash: true,
 
             done_quiet_ms: default_done_quiet_ms(),
+            settings_win_pos: None,
         }
     }
 }
