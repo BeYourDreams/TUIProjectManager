@@ -36,7 +36,7 @@ impl Default for CellSnap {
 }
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{CursorShape, Processor};
 use eframe::egui;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
@@ -739,12 +739,32 @@ const LOADING_MAX_MS: u64 = 5_000;
 /// 命令输出/回答正文一次变几十上百格；秒表/时钟/进度条一跳只改 1~3 格。
 const MIN_CONTENT_CELLS: usize = 4;
 
+/// 「一小块被重画」的上限（可见格数）：一块输出只写了这么几格，就算「画面还在
+/// 动」。用来兜住 **采样别名**——spinner 每 100ms 转一格，若一个 PTY 读块里正好
+/// 转满一圈，逐格比字符得到的 diff 就是 0（前后是同一个字符），页签会在静默门槛
+/// 后谎报完成，而它其实一直在跑。整屏重画（几百格）远超这个数，仍然算零变化。
+const SMALL_REDRAW_CELLS: usize = 16;
+
+/// 本块输出「被写过」的可见格数（含光标格：alacritty 的 damage 总会算上它）。
+/// 与 `diff_screen_cells` 的区别是它数**写操作**而不是采样后的字符差，所以
+/// 「一块里转满一圈」的 spinner 也数得出来。读的同时复位 damage。
+fn take_damage_cells(t: &mut Term<SessionListener>) -> usize {
+    let n = match t.damage() {
+        TermDamage::Full => usize::MAX,
+        TermDamage::Partial(it) => it.map(|b| b.right - b.left + 1).sum(),
+    };
+    t.reset_damage();
+    n
+}
+
 /// 逐块比对可见格 → 刷「画面在动 / 成规模内容」两个时间戳。
 /// 前台（build_snapshot）与后台（display_iter）两条快照路径共用，避免两份口径
 /// 漂移（历史上两端口径不一致会让切页时误判整屏变化）。
 ///
-/// - `diff == 0`：整屏重画同样的字 → 一个时间戳都不刷。这正是「明明静止却
-///   常亮 🔄、✅ 永远不亮」的成因。
+/// - `diff == 0` 且 `damaged` 超过 `SMALL_REDRAW_CELLS`：整屏重画同样的字 →
+///   一个时间戳都不刷。这正是「明明静止却常亮 🔄、✅ 永远不亮」的成因。
+/// - `diff == 0` 但 `damaged` 只有几格：**采样别名**（见 `SMALL_REDRAW_CELLS`）——
+///   按「画面在动」刷 `last_screen_change_ms`，不刷内容。
 /// - `diff >= MIN_CONTENT_CELLS`：另刷 `last_content_ms` 并把 `output_count` 顶到
 ///   ≥1（通知侧的门槛由它管）。
 /// - 任意 `diff > 0`：刷 `last_screen_change_ms`——页签 🔄/✅ 只看它。
@@ -756,13 +776,16 @@ const MIN_CONTENT_CELLS: usize = 4;
 /// 不一致」。静止的页签就是静止的，resize 不改变这一点。
 pub(crate) fn stamp_screen_activity(
     diff: usize,
+    damaged: usize,
     now_ms: u64,
     screen: &AtomicU64,
     content: &AtomicU64,
     output_count: &AtomicU32,
     resized: bool,
 ) {
-    if diff == 0 || resized {
+    // 几格的小改动 + 字符 diff=0 = 动画在转，只是采样点撞回了同一个字符（spinner 别名）。
+    let alias = diff == 0 && damaged > 0 && damaged <= SMALL_REDRAW_CELLS;
+    if resized || (diff == 0 && !alias) {
         return;
     }
     screen.store(now_ms, Ordering::Relaxed);
@@ -1299,20 +1322,27 @@ strip_orphan_csi_u_bytes_into(&mut stripped, &merged);
                         //    后台一次性解析整块数据，降低锁竞争频率。
                         //    前台：4KB 块间隙足够 UI 拿读锁渲染/响应输入。
                         //    后台：不可见，无需频繁释放锁给 UI，一次加锁解析整块。
+                        // 本块输出写过多少格（见 take_damage_cells）：与字符 diff 一起
+                        // 喂给 stamp_screen_activity，兜住 spinner 采样别名。
+                        let mut damaged_cells = 0usize;
                         if is_fg {
                             const CHUNK_SIZE: usize = 4096;
                             let mut offset = 0usize;
                             while offset < merged.len() {
                                 let end = (offset + CHUNK_SIZE).min(merged.len());
                                 let chunk = &merged[offset..end];
-                                let reply = {
+                                let (reply, dmg) = {
                                     let mut t = term.write().unwrap_or_else(|e| e.into_inner());
                                 let r = guarded(|| {
                                 parser.advance(&mut *t, chunk);
-                                reply_to_queries(
-                                    &t,
-                                    chunk,
-                                    theme_dark.load(Ordering::Relaxed),
+                                let dmg = take_damage_cells(&mut t);
+                                (
+                                    reply_to_queries(
+                                        &t,
+                                        chunk,
+                                        theme_dark.load(Ordering::Relaxed),
+                                    ),
+                                    dmg,
                                 )
                             });
                                     match r {
@@ -1325,6 +1355,7 @@ crate::log_crash("reader-panic", &format!("VT 解析 panic，前台页签会话�
                                         }
                                     }
 }; // ← term 锁在此释放
+                                damaged_cells += dmg;
                                 if let Some((reply, osc_color)) = reply {
                                     if osc_color {
                                         osc_theme_aware.store(true, Ordering::Relaxed);
@@ -1336,14 +1367,18 @@ crate::log_crash("reader-panic", &format!("VT 解析 panic，前台页签会话�
                         } else {
                             // 后台会话：一次加锁解析整块数据（不可见，
                             // 无需频繁释放锁给 UI，降低锁竞争频率）。
-                            let reply = {
+                            let (reply, dmg) = {
                                 let mut t = term.write().unwrap_or_else(|e| e.into_inner());
                                 let r = guarded(|| {
                                     parser.advance(&mut *t, merged);
-                                    reply_to_queries(
-                                        &t,
-                                        merged,
-                                        theme_dark.load(Ordering::Relaxed),
+                                    let dmg = take_damage_cells(&mut t);
+                                    (
+                                        reply_to_queries(
+                                            &t,
+                                            merged,
+                                            theme_dark.load(Ordering::Relaxed),
+                                        ),
+                                        dmg,
                                     )
                                 });
                                 match r {
@@ -1355,6 +1390,7 @@ crate::log_crash("reader-panic", &format!("VT 解析 panic（后台页签），�
                                     }
                                 }
                             }; // ← term 锁在此释放
+                            damaged_cells = dmg;
                             if let Some((reply, osc_color)) = reply {
                                 if osc_color {
                                     osc_theme_aware.store(true, Ordering::Relaxed);
@@ -1417,6 +1453,7 @@ crate::log_crash("reader-panic", &format!("VT 解析 panic（后台页签），�
                                         if !scrolled {
                                             stamp_screen_activity(
                                                 diff,
+                                                damaged_cells,
                                                 now_ms,
                                                 &reader_last_screen_change,
                                                 &reader_last_content,
@@ -1465,6 +1502,7 @@ crate::log_crash("reader-panic", &format!("VT 解析 panic（后台页签），�
                                         if !scrolled {
                                             stamp_screen_activity(
                                                 diff,
+                                                damaged_cells,
                                                 now_ms,
                                                 &reader_last_screen_change,
                                                 &reader_last_content,
@@ -1660,7 +1698,7 @@ use super::*;
         let content = AtomicU64::new(0);
         let count = AtomicU32::new(0);
         let call = |diff: usize, t: u64| {
-            stamp_screen_activity(diff, t, &screen, &content, &count, false);
+            stamp_screen_activity(diff, 0, t, &screen, &content, &count, false);
         };
 
         // ① 零变化：全都不动。
@@ -1692,7 +1730,7 @@ use super::*;
         let content = AtomicU64::new(0);
         let count = AtomicU32::new(0);
         // 全屏格数级别的 diff + resized=true：一个时间戳都不许刷。
-        stamp_screen_activity(2_400, 9_000, &screen, &content, &count, true);
+        stamp_screen_activity(2_400, 2_400, 9_000, &screen, &content, &count, true);
         assert_eq!(
             (screen.load(Ordering::Relaxed), content.load(Ordering::Relaxed)),
             (0, 0),
@@ -1700,9 +1738,28 @@ use super::*;
         );
         assert_eq!(count.load(Ordering::Relaxed), 0);
         // 同样的 diff 但来自真输出 → 照旧记账（别把这条修成「大变化也不算」）。
-        stamp_screen_activity(2_400, 9_000, &screen, &content, &count, false);
+        stamp_screen_activity(2_400, 2_400, 9_000, &screen, &content, &count, false);
         assert_eq!(screen.load(Ordering::Relaxed), 9_000);
         assert_eq!(content.load(Ordering::Relaxed), 9_000);
+    }
+
+    /// 单格 spinner 采样别名：一个读块里转满一圈 → 字符 diff=0，但 damage 只有几格。
+    /// 不能误判成「整屏重画同样的字」：要按画面在动刷 screen，不刷 content。
+    #[test]
+    fn small_damage_alias_counts_as_motion() {
+        let screen = AtomicU64::new(0);
+        let content = AtomicU64::new(0);
+        let count = AtomicU32::new(0);
+        stamp_screen_activity(0, 2, 5_000, &screen, &content, &count, false);
+        assert_eq!(
+            screen.load(Ordering::Relaxed),
+            5_000,
+            "别名应保持活跃，避免静默后谎报完成"
+        );
+        assert_eq!(content.load(Ordering::Relaxed), 0, "别名不算成规模内容");
+        // 真·整屏重画同样的字：damage 大 → 仍不算。
+        stamp_screen_activity(0, 400, 6_000, &screen, &content, &count, false);
+        assert_eq!(screen.load(Ordering::Relaxed), 5_000);
     }
 
     /// `diff_screen_cells` 的两条口径：长度不同 = 尺寸变了（报 resized，diff 不

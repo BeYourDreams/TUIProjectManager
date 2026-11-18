@@ -90,27 +90,24 @@ fn frame_delay_ms(interacting: bool, busy: bool, app_fg: bool) -> u64 {
 /// 代价是 1Hz 时钟/秒表这类持续小刷新也会常驻 🔄（与慢进度在屏幕上不可区分）。
 /// 另一侧代价：真·无任何画面变化的静默等待会在门槛后被判为完成。
 ///
-/// 为什么门槛是 8s 而不是 3s（用户反馈「状态被误判完成，实际还在执行中」）：
+/// 为什么默认 3s 而不是更短（用户反馈「状态被误判完成，实际还在执行中」）：
 /// agent 回合里的静默极常见——按下回车到首个 token 到达（模型排队/网络）、跑一条
 /// 不出字的命令（编译、等网络）、工具执行期间 TUI 只在有变化时重绘。这些静默与
-/// 「回合真的跑完了」在屏幕上**不可区分**，所以只能整体后延：✅ 推迟 5s 亮起，
-/// 换来这 5s 内继续亮 🔄。代价是真跑完的页签晚 5s 变 ✅（页签在跑态多挂 5s，
+/// 「回合真的跑完了」在屏幕上**不可区分**，所以只能整体后延：✅ 推迟 3s 亮起，
+/// 换来这 3s 内继续亮 🔄。代价是真跑完的页签晚 3s 变 ✅（页签在跑态多挂 3s，
 /// 远好过谎报完成 + 误弹「任务完成」）。系统通知另有更严的 [`TOAST_QUIET_MS`]
 /// （10s），不受此值影响。
 ///
-/// **已开放成设置**（`settings.done_quiet_ms`，设置页「🚦 页签状态」里拖）：
-/// 8s 只是默认值。它本质是「谎报完成」与「✅ 迟亮」之间的取舍，没有两头都好的
+/// **已开放成设置**（`settings.done_quiet_ms`，设置页「🚦 页签状态」里填）：
+/// 3s 只是默认值。它本质是「谎报完成」与「✅ 迟亮」之间的取舍，没有两头都好的
 /// 数——手上 agent 的静默节奏各机器不一样，所以交给用户调。本常量退化为默认值
 /// 与单测口径（判定函数一律按参数走，不读全局）。合法区间见 config.rs 的
 /// [`config::DONE_QUIET_MIN_MS`] / [`config::DONE_QUIET_MAX_MS`]。
 /// 生产路径已全走 `settings.done_quiet_ms`，只剩单测拿它当固定口径，故在非
 /// test 构建下放行死代码告警（与 `cmd_arg` 同理）。
 #[cfg_attr(not(test), allow(dead_code))]
-const DONE_QUIET_MS: u64 = 8_000;
-/// 设置页里这个滑杆的区间（秒）：1s（再小屏幕一动就 🔄、✅ 永不亮）到 5 分钟
-/// （再长就是拿不到完成信号，不是“延迟”了）。步进 0.5s。
-const DONE_QUIET_SLIDER_S: std::ops::RangeInclusive<f64> = 1.0..=300.0;
-/// 交互帧率窗口：键盘/IME/粘贴/点击转发写 `last_input_ms`、滚轮转发写
+const DONE_QUIET_MS: u64 = 3_000;
+
 /// `last_scroll_ms`（terminal.rs 统一记账），**只用来把整窗帧率拉到交互档**
 /// （见 [`frame_delay_ms`]）。页签状态判定不读这两个时间戳：回显与真输出同路。
 const INPUT_ACTIVE_MS: u64 = 1_500;
@@ -3243,6 +3240,9 @@ pub struct ClientApp {
     pub settings_command: String,
     pub settings_commands: Vec<String>,
     pub settings_new_command: String,
+    /// 「判完成延迟」数字输入框的编辑缓冲：编辑期以它为准（每帧从配置重建会把
+    /// 刚敲的字冲掉），失焦后回填配置里的夹紧值。
+    done_quiet_edit: String,
     /// 编辑命令时的索引和缓冲区（Some(i) = 内联编辑第 i 行）。
     pub settings_edit_idx: Option<usize>,
     pub settings_edit_buffer: String,
@@ -3528,7 +3528,7 @@ fn refresh_tab_state(s: &crate::session::Session, now_ms: u64, done_quiet_ms: u6
     s.state_icon.store(code | flags, Ordering::Relaxed);
 // 完成态与图标同源同刻、同一份判据：只有「会亮 ✅」的快照才允许进入
     // 「任务完成」通知分支——退出/加载中不算、画面高频动不算、成规模内容
-    // 静默 ≥8s 且未查看才算。通知那侧另有
+    // 静默 ≥3s 且未查看才算。通知那侧另有
     // out_bytes / viewed / 10s 静默等门槛（见 update_done_states）。
     s.state_done.store(code == ICON_DONE, Ordering::Relaxed);
 }
@@ -3933,6 +3933,7 @@ impl ClientApp {
             settings_command,
             settings_commands,
             settings_new_command: String::new(),
+            done_quiet_edit: String::new(),
             settings_edit_idx: None,
             settings_edit_buffer: String::new(),
             settings_tool_dirs,
@@ -5270,7 +5271,7 @@ pad: tab_margin.left as f32 + tab_margin.right as f32,
                     let now_ms = crate::now_ms();
 // ── 状态判定：仅凭屏幕可见格的变化 ──
                     // reader 逐块比对可见格快照（见 session.rs MIN_CONTENT_CELLS）：
-                    // 成规模变化 ≤3s → 🔄，停了 ≥8s → ✅/空；整屏重画同样的字、
+                    // 成规模变化 ≤3s → 🔄，停了 ≥3s → ✅/空；整屏重画同样的字、
                     // 秒表时钟的小刷新、滚轮/输入回显都不算内容（滚动只改视口）。
                     // 判定只看终端输出，没有「用户驱动例外」。
                     // 状态快照：最快 1s 重算一次（STATE_CHECK_MS），退出/加载/
@@ -6424,20 +6425,26 @@ match self.config.settings.project_sort {
     /// 设置，按自己手上 agent 的节奏调。
     fn tab_state_section_ui(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("🚦 页签状态").strong());
-        let mut secs = self.config.settings.done_quiet_ms as f64 / 1000.0;
+        // 纯数字输入（毫秒）：非数字进不了缓冲，省掉「输入 abc 怎么办」。缓冲留在
+        // App 里——每帧从配置重建会把刚敲的字冲掉；编辑期只更新配置不落盘，
+        // 失焦时按夹紧值回填并写一次 config.json。
+        let mut buf = std::mem::take(&mut self.done_quiet_edit);
         let resp = ui
-            .add(
-                egui::Slider::new(&mut secs, DONE_QUIET_SLIDER_S)
-                    .step_by(0.5)
-                    .suffix(" 秒")
-                    .text("判完成延迟")
-                    .show_value(true),
-            )
-            .on_hover_text(
-                "屏幕（任一可见格）静止满这个时长才判「跑完了」、页签才亮 ✅。\
-                 调大：更少谎报完成，但 ✅ 晚亮；调小：✅ 早亮，但回合中途的静默\
-                 （等首个 token / 跑一条不出字的命令）会被误判成完成。",
-            );
+            .horizontal(|ui| {
+                ui.label("判完成延迟");
+                ui.add(
+                    egui::TextEdit::singleline(&mut buf)
+                        .desired_width(80.0)
+                        .hint_text("3000"),
+                )
+                .on_hover_text(
+                    "屏幕（任一可见格）静止满这个时长才判「跑完了」、页签才亮 ✅。\n\
+                     合法范围 1000 ~ 300000 毫秒。\n\
+                     调大：更少谎报完成，但 ✅ 晚亮；调小：✅ 早亮，但回合中途的静默\
+                     （等首个 token / 跑一条不出字的命令）会被误判成完成。",
+                )
+            })
+            .inner;
         ui.label(
             RichText::new(
                 "屏幕（任一可见格）静止满这个时长且期间一格都没变，页签才亮 ✅；在此之前一律 \
@@ -6447,23 +6454,20 @@ match self.config.settings.project_sort {
             .weak()
             .small(),
         );
-        if !resp.changed() {
-            return;
+        if resp.changed() {
+            // egui 0.36 没有 char_filter：粘进来的非数字在这一行剔掉，缓冲始终只有数字。
+            buf.retain(|c| c.is_ascii_digit());
+            if let Ok(ms) = buf.parse::<u64>() {
+                self.config.settings.done_quiet_ms = config::clamp_done_quiet_ms(ms);
+            }
         }
-        // 秒 → 毫秒：步进 0.5s，换算后仍是整数毫秒（500 的倍数）。夹一次是兜
-        // 住手改 config.json 留下的出界值（滑杆自己不会越界）。
-        let ms = config::clamp_done_quiet_ms((secs * 1000.0).round() as u64);
-        if ms == self.config.settings.done_quiet_ms {
-            return;
+        // 失焦：出界/非法输入在这里被夹回并回显，只写一次盘。
+        if resp.lost_focus() {
+            let ms = self.config.settings.done_quiet_ms;
+            buf = ms.to_string();
+            self.save_config(format!("页签状态已保存：判完成延迟 {ms} 毫秒"));
         }
-        // 新值**立刻生效**（页签状态机每帧读 settings），但**只在松手时落盘**：
-        // 拖着滑杆走会每帧 changed()，逐帧 save_config 就是逐帧写一份
-        // config.json（tmp + fsync + rename）。
-        self.config.settings.done_quiet_ms = ms;
-        let released = ui.input(|i| i.pointer.any_released());
-        if released || !resp.dragged() {
-            self.save_config(format!("页签状态已保存：判完成延迟 {:.1} 秒", ms as f64 / 1000.0));
-        }
+        self.done_quiet_edit = buf;
     }
 
     /// 进设置页时读一次「上次展开哪一块」（egui persisted，与折叠状态一样跨重
@@ -10029,6 +10033,7 @@ fn wheel_scrolls_even_when_active_tab_is_out_of_view() {
             settings_command: String::new(),
             settings_commands: Vec::new(),
             settings_new_command: String::new(),
+            done_quiet_edit: String::new(),
             settings_edit_idx: None,
             settings_edit_buffer: String::new(),
             settings_tool_dirs: Vec::new(),

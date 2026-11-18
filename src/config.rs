@@ -86,7 +86,7 @@ fn default_true() -> bool {
     true
 }
 fn default_done_quiet_ms() -> u64 {
-    8_000
+    3_000
 }
 
 /// 页签「✅ 判完成」的静默门槛的合法区间（毫秒）。
@@ -951,7 +951,7 @@ assert_eq!(d.base_url, "http://localhost:20128/v1");
         assert!(old.notify_toast && old.notify_flash);
     }
 
-    /// 「✅ 判完成」的静默门槛：默认 8s；旧配置没这字段时也得是 8s（否则老用户
+    /// 「✅ 判完成」的静默门槛：默认 3s；旧配置没这字段时也得是 3s（否则老用户
     /// 升级后门槛变成 0，屏幕一动就 🔄、✅ 永不亮）。手改出界的值夹回区间。
     #[test]
     fn done_quiet_ms_default_and_clamped() {

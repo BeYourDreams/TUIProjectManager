@@ -1069,16 +1069,13 @@ if resized {
     // 档位来自 raw_input_hook 统计的原始事件（见 Wheel），不用 egui 的
     // smooth_scroll_delta：那份位移被摊到 ~50 帧，按帧换算会把一次拨轮放大
     // 成几十行（滚一下翻过好几屏）。这里只做命中判定与动作派发。
-    // 用 pointer_hover_pos() + latest_pos() 双重检测：
-    // hover_pos() 在 click_and_drag 感知下某些帧返回 None；
-    // latest_pos() 在纯滚轮操作（无鼠标移动）时也可能返回 None。
-    // 合并为单次 input 调用，减少锁获取。
+    // 命中判定必须**按层**算，不能只看坐标：设置浮层（Foreground 的 Area）
+    // 盖在终端（Background 层）上时，指针在浮层里同样落在终端矩形内——只看
+    // 坐标的话，在浮层里拨轮会连带把终端也滚了。`rect_contains_pointer` 是
+    // egui 现成的「坐标 + 顶层」判定：该位置最上层不是终端这一层就返回 false，
+    // 滚轮自然留给浮层自己的 ScrollArea。
     // 未被终端消费的帧（指针在别处）直接丢弃：滚轮不排队，否则会攒成延迟滚动。
-    let over_term = wheel.has_scroll()
-        && ui.input(|i| {
-            i.pointer.hover_pos().is_some_and(|p| rect.contains(p))
-                || i.pointer.latest_pos().is_some_and(|p| rect.contains(p))
-        });
+    let over_term = wheel.has_scroll() && ui.rect_contains_pointer(rect);
     if over_term {
         // 清掉 egui 的平滑增量：终端自己按档位滚动，同一份位移不能再流向
         // 其他 ScrollArea（页签栏/设置页），否则滚终端会连带滚别的滚动区。
