@@ -8942,11 +8942,10 @@ if self.spawning.is_empty() && !self.restore_slots.is_empty() {
                     };
                     // 页签崩溃隔离：渲染闭包可能 panic（egui 绘制/term 越界等）。
                     // catch_unwind 捕获后关闭该页签，整个软件继续运行。
-                    let (dark, status, term_focused) = (
-                        self.effective_dark(),
-                        &mut self.status,
-                        &mut self.term_focused,
-                    );
+                    let dark = self.effective_dark();
+                    // 设置浮层打开时终端不得抢焦点/吞键盘，否则其上的输入框无法输入（焦点被每帧拽回终端）。
+                    let mut term_focused_eff = self.term_focused && !self.settings_open;
+                    let status = &mut self.status;
                     let wheel = &self.wheel;
                     let sess = match self.tabs.get_mut(self.current) {
                         Some(Tab::Session(s)) => s,
@@ -8959,7 +8958,7 @@ if self.spawning.is_empty() && !self.restore_slots.is_empty() {
                                 sess,
                                 dark,
                                 status,
-                                term_focused,
+                                &mut term_focused_eff,
                                 wheel,
                             );
                         }),
@@ -8973,6 +8972,9 @@ if self.spawning.is_empty() && !self.restore_slots.is_empty() {
                                 .unwrap_or_else(|| "未知错误".to_string()),
                         ),
                     };
+                    if !self.settings_open {
+                        self.term_focused = term_focused_eff;
+                    }
                     if let Some(reason) = crashed {
                         let idx = self.current;
                         let (dir, title) = match self.tabs.get(idx) {

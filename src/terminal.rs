@@ -1016,6 +1016,11 @@ if resized {
     // 切到首页（斜杠命令里 Tab 补全 + 回车提交就会踩到，方向键翻历史同样会）。
     // 终端聚焦期间：声明独占这四类键（set_focus_lock_filter 要求已有焦点，故在
     // 拿到焦点后的下一帧生效），并把被抢走的焦点当帧拽回终端。
+    //
+    // 规则：只要有更高优先级的 UI 需要键盘输入（设置浮层、带输入框的弹窗等），
+    // 调用方必须传入 *term_focused == false；否则此处每帧 request_focus 会把焦点
+    // 从 TextEdit 等控件拽回终端，表现为“光标闪烁但无法输入”。新增覆盖终端的
+    // 输入 UI 时必须同步屏蔽终端焦点。
     if *term_focused {
         if ui.memory(|m| m.focused()) != Some(term_id) {
             resp.request_focus();
