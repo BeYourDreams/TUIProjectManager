@@ -4044,8 +4044,9 @@ search_query: String::new(),
         } else {
             saved_active - 1
         };
-        // 没有会话可恢复也要有个确定落点（首页或空，不越界）。
-        app.restore_active = Some(saved_active.min(app.tabs.len() - 1));
+        // 这里 tabs 只有首页，不能按它裁剪（否则激活索引永远变成 0）；
+        // 等恢复完成后，ui() 会按实际页签数裁剪。
+        app.restore_active = Some(saved_active);
 
         // 每次启动自动检查一次更新。
         app.check_updates(true);
