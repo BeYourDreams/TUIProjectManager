@@ -4175,6 +4175,8 @@ fn strip_geom_for_frame(
         self.settings_new_command.clear();
         self.settings_tool_dirs = self.config.settings.tool_paths.clone();
         self.settings_new_tool_dir.clear();
+        // 判完成延迟输入框：每次打开都从当前配置回填，避免上次未失焦/未保存的残值。
+        self.done_quiet_edit = format!("{:.2}", self.config.settings.done_quiet_ms as f64 / 1000.0);
         self.settings_open = true;
     }
 
@@ -6417,7 +6419,7 @@ match self.config.settings.project_sort {
         }
     }
 
-    /// 设置页的「页签状态」区：✅ 判完成的**延迟静默门槛**（`done_quiet_ms`）。
+    /// 设置页的「页签状态」区：✅ 判完成的**延迟静默门槛**（`done_quiet_ms`，内部毫秒存储）。
     ///
     /// 这个数就是 README 里那条固有边界的旋钮：屏幕启发式分不清「回合中途的
     /// 静默」与「真跑完了」，只能整体后延一段时间才判完成。调大 → 少谎报完成
@@ -6425,24 +6427,29 @@ match self.config.settings.project_sort {
     /// 设置，按自己手上 agent 的节奏调。
     fn tab_state_section_ui(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("🚦 页签状态").strong());
-        // 纯数字输入（毫秒）：非数字进不了缓冲，省掉「输入 abc 怎么办」。缓冲留在
-        // App 里——每帧从配置重建会把刚敲的字冲掉；编辑期只更新配置不落盘，
-        // 失焦时按夹紧值回填并写一次 config.json。
+        // 秒输入（最多两位小数）：缓冲留在 App 里，编辑期只更新内存配置不落盘；
+        // 失焦/点 ±1 时按夹紧值回填并写一次 config.json。
         let mut buf = std::mem::take(&mut self.done_quiet_edit);
-        let resp = ui
+        let mut commit_now = false;
+        let (resp, minus, plus) = ui
             .horizontal(|ui| {
                 ui.label("判完成延迟");
-                ui.add(
-                    egui::TextEdit::singleline(&mut buf)
-                        .desired_width(80.0)
-                        .hint_text("3000"),
-                )
-                .on_hover_text(
-                    "屏幕（任一可见格）静止满这个时长才判「跑完了」、页签才亮 ✅。\n\
-                     合法范围 1000 ~ 300000 毫秒。\n\
-                     调大：更少谎报完成，但 ✅ 晚亮；调小：✅ 早亮，但回合中途的静默\
-                     （等首个 token / 跑一条不出字的命令）会被误判成完成。",
-                )
+                let resp = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut buf)
+                            .desired_width(80.0)
+                            .hint_text("3.00"),
+                    )
+                    .on_hover_text(
+                        "屏幕（任一可见格）静止满这个时长才判「跑完了」、页签才亮 ✅。\n\
+                         单位：秒，可输入两位小数；合法范围 1.00 ~ 300.00 秒。\n\
+                         调大：更少谎报完成，但 ✅ 晚亮；调小：✅ 早亮，但回合中途的静默\
+                         （等首个 token / 跑一条不出字的命令）会被误判成完成。",
+                    );
+                ui.label("秒");
+                let minus = ui.button("-1").on_hover_text("减少 1 秒").clicked();
+                let plus = ui.button("+1").on_hover_text("增加 1 秒").clicked();
+                (resp, minus, plus)
             })
             .inner;
         ui.label(
@@ -6454,18 +6461,52 @@ match self.config.settings.project_sort {
             .weak()
             .small(),
         );
-        if resp.changed() {
-            // egui 0.36 没有 char_filter：粘进来的非数字在这一行剔掉，缓冲始终只有数字。
-            buf.retain(|c| c.is_ascii_digit());
-            if let Ok(ms) = buf.parse::<u64>() {
-                self.config.settings.done_quiet_ms = config::clamp_done_quiet_ms(ms);
+
+        let sanitize_sec = |s: &mut String| {
+            let mut out = String::with_capacity(s.len());
+            let mut dot = false;
+            let mut frac = 0usize;
+            for c in s.chars() {
+                if c.is_ascii_digit() {
+                    if dot {
+                        if frac < 2 {
+                            out.push(c);
+                            frac += 1;
+                        }
+                    } else {
+                        out.push(c);
+                    }
+                } else if c == '.' && !dot {
+                    out.push('.');
+                    dot = true;
+                }
+            }
+            *s = out;
+        };
+
+        if minus || plus {
+            let delta: i64 = if plus { 1000 } else { -1000 };
+            let ms = (self.config.settings.done_quiet_ms as i64 + delta)
+                .clamp(config::DONE_QUIET_MIN_MS as i64, config::DONE_QUIET_MAX_MS as i64)
+                as u64;
+            self.config.settings.done_quiet_ms = ms;
+            buf = format!("{:.2}", ms as f64 / 1000.0);
+            commit_now = true;
+        } else if resp.changed() {
+            sanitize_sec(&mut buf);
+            if let Ok(sec) = buf.parse::<f64>() {
+                let ms = (sec * 1000.0).round() as i64;
+                if ms >= 0 {
+                    self.config.settings.done_quiet_ms =
+                        config::clamp_done_quiet_ms(ms as u64);
+                }
             }
         }
-        // 失焦：出界/非法输入在这里被夹回并回显，只写一次盘。
-        if resp.lost_focus() {
+        // 失焦：出界/非法输入在这里被夹回并回显，只写一次盘。±1 立即落盘。
+        if resp.lost_focus() || commit_now {
             let ms = self.config.settings.done_quiet_ms;
-            buf = ms.to_string();
-            self.save_config(format!("页签状态已保存：判完成延迟 {ms} 毫秒"));
+            buf = format!("{:.2}", ms as f64 / 1000.0);
+            self.save_config(format!("页签状态已保存：判完成延迟 {:.2} 秒", ms as f64 / 1000.0));
         }
         self.done_quiet_edit = buf;
     }
