@@ -2898,6 +2898,27 @@ fn tab_cycle_target(tabs: &[Tab], current: usize, fwd: bool) -> Option<usize> {
     Some(ring[(pos + if fwd { 1 } else { n - 1 }) % n])
 }
 
+/// 页签栏滚轮 → 切页步数（纯函数，一格一步；触摸板连续位移约 40 点一步）。
+/// 方向沿用旧的页签条横滚：向下滚去后面的页签，向上滚回前面的（含首页）。
+///
+/// 用 raw_input_hook 统计的原始档位（见 terminal::Wheel），不是 egui 的
+/// smooth_scroll_delta：后者把一格摊到几十帧，按帧判会连跳好几个页签。
+fn tab_wheel_steps(wheel: terminal::Wheel) -> i32 {
+    let steps = -(wheel.notches.round() + (wheel.pad / 40.0).round());
+    (steps as i32).clamp(-8, 8)
+}
+
+/// 滚轮切页目标：在整条页签栏上循环，0（首页）也在环里（纯函数）。
+/// Ctrl+Tab 故意排除首页（见 tab_cycle_target），滚轮不排除。
+fn tab_wheel_target(tabs: &[Tab], current: usize, steps: i32) -> Option<usize> {
+    if tabs.is_empty() || steps == 0 {
+        return None;
+    }
+    let n = tabs.len() as i32;
+    let cur = (current as i32).clamp(0, n - 1);
+    Some((cur + steps).rem_euclid(n) as usize)
+}
+
 /// 检查单个工具（pi / opencode）的新版本：按 tool_dirs（默认本软件所在目录）
 /// → PATH 定位 exe → `--version` 读本地版本 → 复用自更新的多源逐个探查拿
 /// 最新 tag → **按产物存在性锚定 tag**（`anchor_tag_on_assets`）→
@@ -5111,6 +5132,20 @@ s.last_reap_ms.store(now_ms, Ordering::Relaxed);
         let dark = self.effective_dark();
         let mut actions: Vec<TabAction> = Vec::new();
         let sel_fill = ui.visuals().selection.bg_fill;
+        // 页签栏上的滚轮 = 切页（含首页），一格一步。用原始档位而非平滑位移，
+        // 免得一次拨轮被摊到几十帧后连跳多个页签。清掉平滑量，首页项目列表
+        // 不再跟着滚；终端矩形不含这一行，不会同时消费同一份输入。
+        let bar_rect = ui.max_rect();
+        if ui.rect_contains_pointer(bar_rect) {
+            let steps = tab_wheel_steps(self.wheel);
+            if steps != 0 {
+                ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+                if let Some(next) = tab_wheel_target(&self.tabs, self.current, steps) {
+                    actions.push(TabAction::Activate(next));
+                }
+            }
+        }
+
         // 布局内边距保持紧凑（页签间距小）；背景色块比布局框大：左右各 5px、
         // 上下各 2px（见下方 rect.expand2），色块视觉上
         // 更饱满，但不撑大页签间距。
@@ -5219,23 +5254,16 @@ pad: tab_margin.left as f32 + tab_margin.right as f32,
                 egui::pos2(avail.right() - TAB_SCROLL_BTN_W, avail.top()),
                 avail.right_bottom(),
             );
-            // 重新武装跟随的两条非滚轮通道（都在切页 / 改视野之外的用户意图里）：
-            //  1. 切页（点击 / Ctrl+Tab / 新建 / 关闭 / 恢复 / 拖动重排）——靠比对
-            //     current 与上次武装时记下的下标，不用给十来处赋值点逐个埋点；
-            //  2. 窗口改宽改窄（用户没拨过滚轮，不重新跟随就会把当前页签挤没）。
+            // 重新武装跟随：切页（点击 / 滚轮 / Ctrl+Tab / 新建 / 关闭 / 恢复 /
+            // 拖动重排）靠比对 current 与上次武装时的下标；窗口改宽改窄也要重新
+            // 跟随，否则当前页签会被挤没。
             if self.current != self.tab_scroll_follow_at || view_w != self.tab_scroll_view_w {
                 self.tab_scroll_follow = true;
                 self.tab_scroll_follow_at = self.current;
                 self.tab_scroll_view_w = view_w;
             }
-            // 滚轮：竖滚轮 → 横移（鼠标最常见），触控板横扫同样生效。只认指针落在
-            // 本行矩形内的滚轮 → 首页/设置**页面**上的滚轮不带动页签栏。
-            let wheel = ui.input(|i| i.smooth_scroll_delta.y + i.smooth_scroll_delta.x);
-            let wheel = if ui.ctx().pointer_interact_pos().is_some_and(|p| view.contains(p)) {
-                wheel
-            } else {
-                0.0
-            };
+            // 滚轮已改为切页（见函数开头）；横向偏移只由两端按钮驱动，
+            // 切页后这里重新武装跟随，把新页签带回视野。
             let active_span = geom
                 .spans
                 .iter()
@@ -5243,20 +5271,12 @@ pad: tab_margin.left as f32 + tab_margin.right as f32,
                 .map(|(_, x, w)| (*x, *w));
             let (off, follow) = strip_offset(
                 self.tab_scroll_x,
-                wheel,
+                0.0,
                 self.tab_scroll_follow,
                 view_w,
                 geom.content_w,
                 active_span,
             );
-            if wheel != 0.0 {
-                // 这一份位移已经被本页签区吃掉，不能再流向别的 ScrollArea（首页
-                // 项目列表等）——照终端 show_terminal 里的做法清掉。两个轴都清：
-                // 横向那份也是本页签区吃掉的。
-                ui.input_mut(|i| {
-                    i.smooth_scroll_delta = egui::Vec2::ZERO;
-                });
-            }
             self.tab_scroll_x = off;
             self.tab_scroll_follow = follow;
 
@@ -5264,6 +5284,7 @@ pad: tab_margin.left as f32 + tab_margin.right as f32,
             // 画在页签**之前**：不叠加就没有「底衬要盖住页签」那层需要，按钮与页签
             // 的矩形互不相交，命中也不会互相抢（egui 取最后注册的那个，之前是靠
             // 「箭头后画所以抢到页签的点击」才实现的）。
+
             // 必须用外层 ui（不是下面那个 clip 到 view 的 shadow child）：按钮在视口
             // 之外，child 的裁剪矩形会把它们整个剪掉。
             if btn_reserve > 0.0 {
@@ -9873,9 +9894,9 @@ mod settings_accordion_tests {
 #[cfg(test)]
 mod restore_coords_tests {
     use super::{
-        offset_to_show, restore_coords, strip_geom, strip_offset, tab_cycle_target, StripMetrics,
-        Tab, TabKind, CLOSE_GAP, CLOSE_GLYPH, CLOSE_HIT_PAD_X, CLOSE_HIT_PAD_Y, SETTINGS_BTN_MARGIN,
-        SETTINGS_WIN,
+        offset_to_show, restore_coords, strip_geom, strip_offset, tab_cycle_target, tab_wheel_steps,
+        tab_wheel_target, StripMetrics, Tab, TabKind, CLOSE_GAP, CLOSE_GLYPH, CLOSE_HIT_PAD_X,
+        CLOSE_HIT_PAD_Y, SETTINGS_BTN_MARGIN, SETTINGS_WIN,
     };
     use eframe::egui;
 
@@ -9915,6 +9936,29 @@ mod restore_coords_tests {
             cur = tab_cycle_target(&tabs, cur, true).unwrap();
             assert!((1..=3).contains(&cur), "Ctrl+Tab 落到了非页签下标 {cur}");
         }
+    }
+
+    /// 回归：页签栏滚轮一格切一页，**首页也在环里**（Ctrl+Tab 的排除规则不适用）。
+    #[test]
+    fn tab_wheel_switches_including_home() {
+        use crate::terminal::Wheel;
+        let tabs = vec![
+            Tab::Home,
+            Tab::Placeholder { title: "A".into() },
+            Tab::Placeholder { title: "B".into() },
+            Tab::Placeholder { title: "C".into() },
+        ];
+        assert_eq!(tab_wheel_steps(Wheel { notches: 1.0, pad: 0.0 }), -1, "向上滚回前面的页签");
+        assert_eq!(tab_wheel_steps(Wheel { notches: -1.0, pad: 0.0 }), 1, "向下滚去后面的页签");
+        assert_eq!(tab_wheel_steps(Wheel { notches: 0.0, pad: 40.0 }), -1);
+        assert_eq!(tab_wheel_steps(Wheel { notches: 0.0, pad: 1000.0 }), -8, "洪泛要封顶");
+        assert_eq!(tab_wheel_target(&tabs, 1, 1), Some(2));
+        assert_eq!(tab_wheel_target(&tabs, 2, 1), Some(3));
+        assert_eq!(tab_wheel_target(&tabs, 3, 1), Some(0), "末尾再往前回首页");
+        assert_eq!(tab_wheel_target(&tabs, 0, -1), Some(3), "首页再往后回末尾页签");
+        assert_eq!(tab_wheel_target(&tabs, 0, 1), Some(1));
+        assert_eq!(tab_wheel_target(&[Tab::Home], 0, 1), Some(0));
+        assert_eq!(tab_wheel_target(&[], 0, 1), None);
     }
 
     /// 没有项目页签时（只剩首页；设置是浮层不是页签）→ 按键不做事，不能
