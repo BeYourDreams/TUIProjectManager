@@ -3397,7 +3397,8 @@ fn watched(is_current: bool, app_fg: bool) -> bool {
 
 /// 页签状态图标（纯函数；参数与 [`Session`] 的屏幕时间戳一一对应，便于逐项钉住）。
 ///
-/// 一律只看**屏幕可见格的变化**（纯画面对比），不按 agent 分家、不追 JSONL/DB：
+/// 仅作**兜底判据**：子程序自报 OSC 7501 时由 session_icon_code 优先采信；
+/// 从未上报才走这里的屏幕可见格对比（纯画面对比），不按 agent 分家、不追 JSONL/DB：
 /// reader 逐块把可见格字符与上次快照比对，`last_change` = 最近一次**任何一个格**
 /// 变了的时刻（`last_screen_change_ms` / `last_content_ms` 取最新）。
 ///
@@ -3452,11 +3453,14 @@ const ICON_DONE: u8 = 1;
 const ICON_BUSY: u8 = 2;
 /// ❌ 已退出（渲染层直接给 ❌，不进快照）。
 const ICON_ERR: u8 = 3;
-/// state_icon 的位掩码：低 2 位图标码。
+/// ❓ OSC 7501 自报 blocked（等权限/回答）。
+const ICON_BLOCKED: u8 = 4;
+/// ⚠ OSC 7501 自报 error（进程还活着，区别 ❌ 已退出）。
+const ICON_WARN: u8 = 5;
 /// state_icon 的位：判定那一刻进程是否已退出。
-const SNAP_EXITED: u8 = 0b100;
+const SNAP_EXITED: u8 = 0b1000;
 /// state_icon 的位：判定那一刻是否加载中。
-const SNAP_LOADING: u8 = 0b1000;
+const SNAP_LOADING: u8 = 0b10000;
 
 fn icon_code(icon: Option<&'static str>) -> u8 {
     match icon {
@@ -3473,8 +3477,56 @@ fn icon_from_code(code: u8) -> Option<&'static str> {
         ICON_DONE => Some("✅"),
         ICON_BUSY => Some("🔄"),
         ICON_ERR => Some("❌"),
+        ICON_BLOCKED => Some("❓"),
+        ICON_WARN => Some("⚠"),
         _ => None,
     }
+}
+
+/// OSC 7501 自报状态 → 图标码（idle = 空，无事可做）。
+fn prog_icon_code(state: u8) -> u8 {
+    match state {
+        crate::session::PROG_IDLE => ICON_EMPTY,
+        crate::session::PROG_WORKING => ICON_BUSY,
+        crate::session::PROG_DONE => ICON_DONE,
+        crate::session::PROG_BLOCKED => ICON_BLOCKED,
+        crate::session::PROG_ERROR => ICON_WARN,
+        _ => ICON_EMPTY,
+    }
+}
+
+/// 图标码的统一判据：退出/加载压过一切，其次 OSC 7501 自报，最后屏幕启发式。
+fn icon_code_with_prog(prog: u8, exited: bool, loading: bool, heuristic: u8) -> u8 {
+    if exited {
+        ICON_ERR
+    } else if loading {
+        ICON_BUSY
+    } else if prog != 0 {
+        // ponytail: 自报后长期采信（同一 PTY 换程序后可能陈旧）→ 升级路径：前台进程变更时清 prog_state。
+        prog_icon_code(prog)
+    } else {
+        heuristic
+    }
+}
+
+/// 两条消费路径（1s 快照 / 每帧渲染）共用的取码入口，避免再次各判各的。
+fn session_icon_code(
+    s: &crate::session::Session,
+    viewed: bool,
+    now_ms: u64,
+    done_quiet_ms: u64,
+) -> u8 {
+    let prog = s.prog_state.load(Ordering::Relaxed);
+    let heuristic = icon_code(tab_icon(
+        false,
+        false,
+        s.output_count.load(Ordering::Relaxed),
+        viewed,
+        s.last_activity_ms(),
+        now_ms,
+        done_quiet_ms,
+    ));
+    icon_code_with_prog(prog, s.exited.load(Ordering::Acquire), s.loading_active(now_ms), heuristic)
 }
 
 /// 「现在该不该重算状态快照」（纯函数，把频率语义钉在测试里）。
@@ -3515,15 +3567,7 @@ fn refresh_tab_state(s: &crate::session::Session, now_ms: u64, done_quiet_ms: u6
         return;
     }
     s.state_check_ms.store(now_ms, Ordering::Relaxed);
-    let code = icon_code(tab_icon(
-        exited,
-        loading,
-        s.output_count.load(Ordering::Relaxed),
-        s.has_been_viewed.load(Ordering::Relaxed),
-        last_change,
-        now_ms,
-        done_quiet_ms,
-    ));
+    let code = session_icon_code(s, s.has_been_viewed.load(Ordering::Relaxed), now_ms, done_quiet_ms);
     let flags = ((exited as u8) * SNAP_EXITED) | ((loading as u8) * SNAP_LOADING);
     s.state_icon.store(code | flags, Ordering::Relaxed);
 // 完成态与图标同源同刻、同一份判据：只有「会亮 ✅」的快照才允许进入
@@ -3555,18 +3599,7 @@ fn tab_icon_from_snap(
 ) -> Option<&'static str> {
     // 直接按当前真实状态算，不再经 1s 采样快照中转：采样/快照的迟滞本身就是
     // 「页签状态跟实际不一致」的来源。通知侧仍走 refresh_tab_state 的 1s 门限。
-    let exited = s.exited.load(Ordering::Acquire);
-    let loading = s.loading_active(now_ms);
-    let last_change = s.last_activity_ms();
-    let code = icon_code(tab_icon(
-        exited,
-        loading,
-        s.output_count.load(Ordering::Relaxed),
-        viewed,
-        last_change,
-        now_ms,
-        done_quiet_ms,
-    ));
+    let code = session_icon_code(s, viewed, now_ms, done_quiet_ms);
     if viewed && code == ICON_DONE {
         return None;
     }
@@ -4798,10 +4831,13 @@ fn move_tab(&mut self, from: usize, target: usize) {
                         // TOAST_QUIET_MS）：✅ 是给眼睛看的、错了刷新一下就好，
                         // 系统通知是打断式的，agent 回合中途的静默（等首个 token /
                         // 跑一条不出字的命令）必须挡住。
-&& toast_quiet_enough(
-                            s.last_content_ms.load(Ordering::Relaxed),
-                            now_ms,
-                        )
+                        // OSC 7501 自报完成是可靠信号，不再要求屏幕静默 10s。
+                        && (s.prog_state.load(Ordering::Relaxed) != 0
+                            || toast_quiet_enough(
+                                s.last_content_ms.load(Ordering::Relaxed),
+                                now_ms,
+                            ))
+
                         && s.out_bytes.load(Ordering::Relaxed) >= MIN_OUTPUT_BYTES
                         // 未查看门槛：启动即 viewed=true，闲置页签（无新输出轮）
                         // 不提醒；用户没交互过的真输出轮才弹（reader 在加载期后
@@ -9237,8 +9273,9 @@ impl ClientApp {
 #[cfg(test)]
 mod tab_icon_tests {
     use super::{
-        icon_code, state_due, tab_icon, toast_quiet_enough, DONE_QUIET_MS, ICON_BUSY,
-        ICON_DONE, ICON_EMPTY, SNAP_EXITED, STATE_CHECK_MS, TOAST_QUIET_MS,
+        icon_code, icon_code_with_prog, icon_from_code, state_due, tab_icon, toast_quiet_enough,
+        DONE_QUIET_MS, ICON_BLOCKED, ICON_BUSY, ICON_DONE, ICON_EMPTY, ICON_ERR, ICON_WARN,
+        SNAP_EXITED, STATE_CHECK_MS, TOAST_QUIET_MS,
     };
 
     /// 只喂「屏幕最后一次变化距今多久」+「是否已查看」。
@@ -9398,6 +9435,22 @@ assert_eq!(tab_icon(false, false, 10, false, 0, 100_000, DONE_QUIET_MS), None);
     fn a_quiet_tab_still_finishes() {
         assert_eq!(icon(1, false, DONE_QUIET_MS + 1), Some("✅"));
         assert_eq!(icon(1, true, DONE_QUIET_MS + 1), None);
+    }
+
+    /// OSC 7501 自报优先；从未上报才退回屏幕启发式；退出/加载仍压过自报。
+    #[test]
+    fn osc7501_status_priority() {
+        use crate::session::{PROG_BLOCKED, PROG_DONE, PROG_ERROR, PROG_IDLE, PROG_WORKING};
+        assert_eq!(icon_code_with_prog(0, false, false, ICON_DONE), ICON_DONE);
+        assert_eq!(icon_code_with_prog(PROG_WORKING, false, false, ICON_DONE), ICON_BUSY);
+        assert_eq!(icon_code_with_prog(PROG_BLOCKED, false, false, ICON_DONE), ICON_BLOCKED);
+        assert_eq!(icon_code_with_prog(PROG_ERROR, false, false, ICON_DONE), ICON_WARN);
+        assert_eq!(icon_code_with_prog(PROG_DONE, false, false, ICON_BUSY), ICON_DONE);
+        assert_eq!(icon_code_with_prog(PROG_IDLE, false, false, ICON_BUSY), ICON_EMPTY);
+        assert_eq!(icon_code_with_prog(PROG_DONE, true, false, ICON_DONE), ICON_ERR);
+        assert_eq!(icon_code_with_prog(PROG_DONE, false, true, ICON_DONE), ICON_BUSY);
+        assert_eq!(icon_from_code(ICON_BLOCKED), Some("❓"));
+        assert_eq!(icon_from_code(ICON_WARN), Some("⚠"));
     }
 }
 #[cfg(test)]

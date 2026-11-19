@@ -83,8 +83,9 @@ fn status_icons_have_glyphs() {
     fo.textures_delta.clear();
 
     let mut bad = vec![];
-    for ch in ['✅', '\u{2705}', '🔄', '\u{1f504}', '❌', '\u{274c}'] {
+    for ch in ['✅', '\u{2705}', '🔄', '\u{1f504}', '❌', '\u{274c}', '❓', '\u{2753}', '⚠', '\u{26a0}'] {
         let a = max_alpha(&ctx, ch);
+
         println!("{ch} U+{:04X} 最大alpha={a}", ch as u32);
         if a < 40 {
             bad.push(format!("{ch}(U+{:04X}) alpha={a}", ch as u32));

@@ -261,6 +261,10 @@ pub struct Session {
     pub state_icon: Arc<AtomicU8>,
     /// 状态快照（app.rs 写）：是否处于「完成态」（通知判据用，与图标同源同刻）。
     pub state_done: Arc<AtomicBool>,
+    /// 子程序通过 OSC 7501 自报的状态码（reader 写、app.rs 读）：
+    /// 0=从未上报/clear（走原有屏幕启发式），1=idle，2=working，3=done，
+    /// 4=blocked，5=error。见 [`scan_program_status`] / `PROG_*`。
+    pub prog_state: Arc<AtomicU8>,
     /// 最近一次向 PTY 写入输入字节的毫秒时间戳。仅供帧率调度判「交互活跃」
     /// （app.rs INPUT_ACTIVE_MS）与回显延迟探针（TUIPM_LATENCY_DEBUG=1）：
     /// **不参与**页签状态判定。
@@ -419,6 +423,13 @@ impl EventListener for SessionListener {
     }
 }
 
+/// OSC 7501（Program Status Protocol）状态码。0 = 未上报 / `state=clear`。
+pub const PROG_IDLE: u8 = 1;
+pub const PROG_WORKING: u8 = 2;
+pub const PROG_DONE: u8 = 3;
+pub const PROG_BLOCKED: u8 = 4;
+pub const PROG_ERROR: u8 = 5;
+
 /// 响应终端能力探测序列（TUI 启动时常用），返回要写回 PTY 的应答字节。
 /// 返回值（字节, 是否应答过 OSC 10/11/4 颜色查询）：后者供主题广播判断
 /// 该会话是否 OS 色，避免向 cmd 等不响 OSC 的 shell 推颜色序列。
@@ -430,6 +441,7 @@ impl EventListener for SessionListener {
 /// - 主键增强查询（ESC[?2;1;0S → ESC[?0u）
 /// - XTWINOPS 像素尺寸（ESC[14t，未知时回 0）
 /// - OSC 10/11/4 颜色查询（ESC]10;? 等 → rgb 值，随当前主题）
+/// - OSC 7501 能力查询（ESC]7501;? → 自报支持的状态/种类）
 ///
 /// XTVERSION（ESC[>0q）不答：没有对端消费它，泄漏为键盘输入纯是噪声。
 ///
@@ -480,6 +492,9 @@ fn reply_to_queries(term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> O
                 out.extend_from_slice(
                     format!("\x1b]{osc_num};rgb:{c}/{c}/{c}\x1b\\").as_bytes(),
                 );
+            } else if osc_num == 7501 && body == b"?" {
+                // 能力查询：回支持的状态/种类，agent 才会开始自报。
+                out.extend_from_slice(b"\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x07");
             } else if osc_num == 4
                 && let Some(rest) = body.strip_suffix(b";?")
                 && let Ok(idx) = String::from_utf8_lossy(rest).parse::<u32>()
@@ -564,6 +579,65 @@ fn reply_to_queries(term: &Term<SessionListener>, bytes: &[u8], dark: bool) -> O
         }
     }
     (!out.is_empty()).then_some((out, osc_color))
+}
+
+/// 解析一块 PTY 输出里的 OSC 7501 上报，返回本块最后一条**根记录**的状态码。
+///
+/// 语法：`ESC ] 7501 ; key=value:...` 以 BEL 或 `ESC \` 结束；body ≤1024 字节，
+/// `state` 必填且是 1..32 个 `[a-z0-9_-]`。带 `id` 的是子记录（子代理/后台
+/// 任务），它们的 working 会挂满整场会话，不驱动本页签。
+///
+/// 不完整的序列返回 None：reader 的跨块 leftover 会把它拼到下一块重扫。
+/// 不合法/超长序列不改变状态（协议要求「宁可丢弃，不可猜」）。
+fn scan_program_status(bytes: &[u8]) -> Option<u8> {
+    const PREFIX: &[u8] = b"\x1b]7501;";
+    let mut rest = bytes;
+    let mut last = None;
+    while let Some(pos) = rest.windows(PREFIX.len()).position(|w| w == PREFIX) {
+        let body = &rest[pos + PREFIX.len()..];
+        let Some(end) = body.iter().position(|&b| b == 0x07 || b == 0x1b) else {
+            break; // 未终止：留给下一块的 leftover
+        };
+        let esc = body[end] == 0x1b;
+        let terminated = !esc || body.get(end + 1) == Some(&b'\\');
+        if terminated && end <= 1024 {
+            if let Some(code) = parse_prog_body(&body[..end]) {
+                last = Some(code);
+            }
+        }
+        let advance = pos + PREFIX.len() + end + if terminated && esc { 2 } else { 1 };
+        if advance >= rest.len() { break; }
+        rest = &rest[advance..];
+    }
+    last
+}
+
+fn parse_prog_body(body: &[u8]) -> Option<u8> {
+    let mut state = None;
+    let mut child = false;
+    for field in body.split(|&b| b == b':') {
+        let Some(eq) = field.iter().position(|&b| b == b'=') else { continue };
+        let (key, val) = (&field[..eq], &field[eq + 1..]);
+        if key == b"id" { child = true; }
+        if key != b"state" || state.is_some() { continue; } // 同 key 首次出现为准
+        if val.is_empty()
+            || val.len() > 32
+            || !val.iter().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'))
+        {
+            return None;
+        }
+        state = Some(match val {
+            b"idle" => PROG_IDLE,
+            b"working" => PROG_WORKING,
+            b"done" => PROG_DONE,
+            b"blocked" => PROG_BLOCKED,
+            b"error" => PROG_ERROR,
+            b"clear" => 0,
+            _ => return None,
+        });
+    }
+    if child { return None; }
+    state
 }
 
 /// 去掉 PTY 输出字节流中的孤儿 CSI-u 残片（kitty 键盘协议回显时
@@ -1045,6 +1119,7 @@ sel_range: None,
     let state_check_ms = Arc::new(AtomicU64::new(0));
     let state_icon = Arc::new(AtomicU8::new(0));
     let state_done = Arc::new(AtomicBool::new(false));
+    let prog_state = Arc::new(AtomicU8::new(0));
     let exited = Arc::new(AtomicBool::new(false));
     // 读取子进程输出的线程。
     let term = Arc::new(RwLock::new(term));
@@ -1067,6 +1142,7 @@ sel_range: None,
         let reader_fg = foreground.clone();
         let reader_loading = loading.clone();
         let reader_viewed = has_been_viewed.clone();
+        let reader_prog_state = prog_state.clone();
         let reader_alt_screen = alt_screen.clone();
         let reader_cursor_hidden = cursor_hidden.clone();
         let parse_gen = parse_gen.clone();
@@ -1290,6 +1366,12 @@ crate::log_crash("reader-panic", &format!("VT 解析 panic（残留块），会�
                         merged.clear();
                         merged.extend_from_slice(&query_leftover);
                         merged.extend_from_slice(&buf[..n]);
+                        // 整块扫一次：前台解析按 4KB 分片，逐片扫会把跨片的
+                        // 7501 报告切断（msg/title 是 base64，很容易跨片）。
+                        if let Some(code) = scan_program_status(&merged) {
+                            reader_prog_state.store(code, Ordering::Relaxed);
+                        }
+
                         // 提取尾部未完成的转义序列：从最后一个 ESC 开始到块尾
                         // 若该段不含 CSI/OSC 终结字节，则是不完整的，保留到下块。
                         query_leftover.clear();
@@ -1584,6 +1666,7 @@ guard_ctx.request_repaint();
         state_check_ms,
         state_icon,
         state_done,
+        prog_state,
         drag_press_pos: None,
         click_press_pos: None,
         mouse_press_pending: None,
@@ -1931,8 +2014,9 @@ assert_eq!(got, vec![(0, 'A'), (1, 'B'), (2, 'C')], "vline0 必须是首行");
         };
         let term = Term::new(Config::default(), &TermSize::new(80, 24), listener);
 // DA 不应答（ConPTY 自己应答）；DSR/DECRQM/kitty/像素尺寸/OSC 颜色照常应答。
-        let bytes = b"\x1b[6n\x1b[?2026$p\x1b[?1000$p\x1b[?u\x1b[14t\x1b]11;?\x1b\\";
+        let bytes = b"\x1b[6n\x1b[?2026$p\x1b[?1000$p\x1b[?u\x1b[14t\x1b]11;?\x1b\\\x1b]7501;?\x07";
         let r = reply_to_queries(&term, bytes, true).unwrap().0;
+
         let s = String::from_utf8_lossy(&r);
         assert!(s.contains("\x1b[1;1R"), "DSR CPR: {s}");
         assert!(s.contains("\x1b[?2026;1$y"), "DECRQM 2026: {s}");
@@ -1940,6 +2024,8 @@ assert_eq!(got, vec![(0, 'A'), (1, 'B'), (2, 'C')], "vline0 必须是首行");
         assert!(s.contains("\x1b[?u"), "kitty 键盘: {s}");
         assert!(s.contains("\x1b[4;0;0t"), "XTWINOPS: {s}");
         assert!(s.contains("\x1b]11;rgb:16161a/16161a/16161a"), "OSC11 深色底: {s}");
+        assert!(s.contains("\x1b]7501;?:states=idle,working,done,blocked,error"), "OSC7501 能力查询: {s}");
+
         // XTVERSION 不应答（无对端消费的查询）。
         assert!(reply_to_queries(&term, b"\x1b[>0q", true).is_none(), "XTVERSION 不应答");
         // 浅色主题下 OSC 11 回白底。
@@ -2080,6 +2166,32 @@ assert_eq!(got, vec![(0, 'A'), (1, 'B'), (2, 'C')], "vline0 必须是首行");
         std::panic::set_hook(old);
         assert!(!panicked, "vendor 已修复 push 洪水 panic；若再次 panic 说明 vendor patch 被破坏");
         assert!(fed <= 5000 * push.len());
+    }
+
+    #[test]
+    fn osc7501_program_status() {
+        // BEL / ST 两种终止符；一块多条取最后一条。
+        assert_eq!(scan_program_status(b"x\x1b]7501;state=working:app=claude\x07y"), Some(PROG_WORKING));
+        assert_eq!(scan_program_status(b"\x1b]7501;state=done\x1b\\"), Some(PROG_DONE));
+        assert_eq!(
+            scan_program_status(b"\x1b]7501;state=working\x07\x1b]7501;state=blocked:kind=permission\x07"),
+            Some(PROG_BLOCKED)
+        );
+        // 子记录（子代理/后台任务）不驱动页签；clear 退回屏幕启发式。
+        assert_eq!(scan_program_status(b"\x1b]7501;state=working:id=job/1\x07"), None);
+        assert_eq!(scan_program_status(b"\x1b]7501;state=clear\x07"), Some(0));
+        // 不完整 / 非法 / 超长：不改变状态。
+        assert_eq!(scan_program_status(b"\x1b]7501;state=working"), None);
+        assert_eq!(scan_program_status(b"\x1b]7501;state=bogus\x07"), None);
+        let big = format!("\x1b]7501;state=working:msg={}\x07", "a".repeat(1100));
+        assert_eq!(scan_program_status(big.as_bytes()), None);
+        // 非 ST 的 ESC 打断上报后，后续合法上报照常解析。
+        assert_eq!(scan_program_status(b"\x1b]7501;state=working\x1bX\x1b]7501;state=done\x07"), Some(PROG_DONE));
+        // 跨块拼接后完整解析（reader 的 leftover 机制）。
+        let mut merged = b"\x1b]7501;state=work".to_vec();
+        assert_eq!(scan_program_status(&merged), None);
+        merged.extend_from_slice(b"ing\x07");
+        assert_eq!(scan_program_status(&merged), Some(PROG_WORKING));
     }
 
 }
