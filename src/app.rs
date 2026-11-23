@@ -361,6 +361,43 @@ unsafe extern "system" {
     fn SetWindowTheme(hwnd: isize, psz_sub_app_name: *const u16, psz_sub_id_list: *const u16) -> i32;
 }
 
+#[cfg(windows)]
+#[repr(C)]
+struct WinPoint { x: i32, y: i32 }
+
+#[cfg(windows)]
+unsafe extern "system" {
+    fn GetCursorPos(lppoint: *mut WinPoint) -> i32;
+    fn SendMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
+}
+
+/// 鼠标是否在原生标题栏上（WM_NCHITTEST → HTCAPTION）。
+/// 标题栏由系统绘制、不在 egui 的 screen_rect 里：指针一移上去 egui 就收到
+/// PointerGone，`rect_contains_pointer` 判不到；但 winit 仍会转发 WM_MOUSEWHEEL，
+/// 所以在这里补一次命中测试。窗口控件（最小化/关闭等）不算标题栏。
+fn cursor_over_titlebar(hwnd: isize) -> bool {
+    #[cfg(windows)]
+    {
+        if hwnd == 0 {
+            return false;
+        }
+        let mut p = WinPoint { x: 0, y: 0 };
+        if unsafe { GetCursorPos(&mut p) } == 0 {
+            return false;
+        }
+        const WM_NCHITTEST: u32 = 0x0084;
+        const HTCAPTION: isize = 2;
+        // MAKELONG(x, y)：两个 16 位有符号坐标打包进 lParam。
+        let lparam = (((p.y as i32) << 16) | (p.x & 0xffff)) as isize;
+        unsafe { SendMessageW(hwnd, WM_NCHITTEST, 0, lparam) == HTCAPTION }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+        false
+    }
+}
+
 /// 只设 DWM 深色属性，不调 refresh_titlebar（避免 SWP_FRAMECHANGED 重置 hover 跟踪）。
 /// 再调 SetWindowTheme 把主题名钉回 DarkMode_Explorer：winit 深浅切换只会
 /// SetWindowTheme(hwnd, L"", …) 复位主题名，纯 DwmSetWindowAttribute 压不住它；
@@ -3401,6 +3438,8 @@ pub struct ClientApp {
     /// 本帧的滚轮输入（raw_input_hook 统计原始事件，见 terminal::Wheel）。
     /// 跨帧不保留：指针不在终端上就该丢弃，否则会攒成延迟滚动。
     wheel: terminal::Wheel,
+    /// 本帧滚轮是否发生在原生标题栏上（egui 此时指针为 PointerGone）。
+    title_wheel_hit: bool,
 }
 
 
@@ -4053,6 +4092,7 @@ restore_active: None,
 search_query: String::new(),
             pending_relaunch: Vec::new(),
             wheel: terminal::Wheel::default(),
+            title_wheel_hit: false,
         };
 
         // 恢复上次退出时打开中的终端页签：目录仍存在则重新拉起 TUI 会话。
@@ -5132,17 +5172,16 @@ s.last_reap_ms.store(now_ms, Ordering::Relaxed);
         let dark = self.effective_dark();
         let mut actions: Vec<TabAction> = Vec::new();
         let sel_fill = ui.visuals().selection.bg_fill;
-        // 页签栏上的滚轮 = 切页（含首页），一格一步。用原始档位而非平滑位移，
-        // 免得一次拨轮被摊到几十帧后连跳多个页签。清掉平滑量，首页项目列表
-        // 不再跟着滚；终端矩形不含这一行，不会同时消费同一份输入。
+        // 页签栏 / 原生标题栏上的滚轮 = 切页（含首页），一格一步。用原始档位
+        // 而非平滑位移，免得一次拨轮被摊到几十帧后连跳多个页签。标题栏不在
+        // egui 客户区里，命中由 raw_input_hook 的 WM_NCHITTEST 补上。清掉平滑量，
+        // 首页项目列表不再跟着滚；终端矩形不含这一行，不会同时消费同一份输入。
         let bar_rect = ui.max_rect();
-        if ui.rect_contains_pointer(bar_rect) {
-            let steps = tab_wheel_steps(self.wheel);
-            if steps != 0 {
-                ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
-                if let Some(next) = tab_wheel_target(&self.tabs, self.current, steps) {
-                    actions.push(TabAction::Activate(next));
-                }
+        let steps = tab_wheel_steps(self.wheel);
+        if steps != 0 && (ui.rect_contains_pointer(bar_rect) || self.title_wheel_hit) {
+            ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+            if let Some(next) = tab_wheel_target(&self.tabs, self.current, steps) {
+                actions.push(TabAction::Activate(next));
             }
         }
 
@@ -8451,6 +8490,15 @@ impl eframe::App for ClientApp {
     /// （滚轮不排队——指针在页签栏/设置页上滚就不该留到终端上）。
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         self.wheel = terminal::collect_wheel(&raw_input.events);
+        // 原生标题栏的滚轮 winit 照发，但 egui 看不到指针。记下命中，并把事件
+        // 从流里摘掉：切页走 tab_bar 里那条路径，egui 的平滑量也不该漏去别处滚。
+        self.title_wheel_hit =
+            self.wheel.has_scroll() && cursor_over_titlebar(self.titlebar_hwnd);
+        if self.title_wheel_hit {
+            raw_input
+                .events
+                .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -10237,6 +10285,7 @@ fn wheel_scrolls_even_when_active_tab_is_out_of_view() {
             search_query: String::new(),
             pending_relaunch: Vec::new(),
             wheel: Default::default(),
+            title_wheel_hit: false,
         }
     }
 }
