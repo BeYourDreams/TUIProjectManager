@@ -7770,6 +7770,30 @@ fn merge_tui_command(list: &mut Vec<String>, cmd: &str, usable: fn(&str) -> bool
         }
     }
 
+    /// context/max 输入框按 k 显示（1000 → 1k），落盘仍是原始数值。
+    fn fmt_cap_k(v: u64) -> String {
+        let (q, r) = (v / 1000, v % 1000);
+        if r == 0 {
+            return format!("{q}k");
+        }
+        let frac = format!("{r:03}").trim_end_matches('0').to_string();
+        format!("{q}.{frac}k")
+    }
+
+    /// 带 k/K 后缀按 k 解析；裸数字按原值解析（兼容直接粘贴原始数值）。
+    fn parse_cap_k(s: &str) -> Option<u64> {
+        let s = s.trim();
+        let (num, scale) = match s.strip_suffix(|c: char| c == 'k' || c == 'K') {
+            Some(num) => (num.trim(), 1_000.0),
+            None => (s, 1.0),
+        };
+        let n: f64 = num.parse().ok()?;
+        if !n.is_finite() || n < 0.0 || n * scale > u64::MAX as f64 {
+            return None;
+        }
+        Some((n * scale).round() as u64)
+    }
+
     /// provider/models 编辑表单（pi / oh-my-pi 共用），返回是否有改动。
     fn provider_list_ui(
         ui: &mut egui::Ui,
@@ -7873,12 +7897,12 @@ fn merge_tui_command(list: &mut Vec<String>, cmd: &str, usable: fn(&str) -> bool
                         let mut ctx_buf = if editing_num {
                             num_edit.as_ref().unwrap().3.clone()
                         } else {
-                            model.context_window.to_string()
+                            Self::fmt_cap_k(model.context_window)
                         };
                         let mut max_buf = if editing_num {
                             num_edit.as_ref().unwrap().4.clone()
                         } else {
-                            model.max_tokens.to_string()
+                            Self::fmt_cap_k(model.max_tokens)
                         };
                         let mut commit_ctx = false;
                         let mut commit_max = false;
@@ -7941,7 +7965,7 @@ fn merge_tui_command(list: &mut Vec<String>, cmd: &str, usable: fn(&str) -> bool
                         });
                         // 失焦提交：解析成功才写回；失败则丢缓冲、字段回显原值。
                         if commit_ctx {
-                            if let Ok(v) = ctx_buf.trim().parse() {
+                            if let Some(v) = Self::parse_cap_k(&ctx_buf) {
                                 model.context_window = v;
                                 dirty = true;
                             }
@@ -7950,7 +7974,7 @@ fn merge_tui_command(list: &mut Vec<String>, cmd: &str, usable: fn(&str) -> bool
                             }
                         }
                         if commit_max {
-                            if let Ok(v) = max_buf.trim().parse() {
+                            if let Some(v) = Self::parse_cap_k(&max_buf) {
                                 model.max_tokens = v;
                                 dirty = true;
                             }
@@ -8055,11 +8079,11 @@ fn merge_tui_command(list: &mut Vec<String>, cmd: &str, usable: fn(&str) -> bool
             return; // 模型行已删：丢弃缓冲
         };
         let mut applied = false;
-        if let Ok(v) = ctx.trim().parse::<u64>() {
+        if let Some(v) = Self::parse_cap_k(&ctx) {
             model.context_window = v;
             applied = true;
         }
-        if let Ok(v) = max.trim().parse::<u64>() {
+        if let Some(v) = Self::parse_cap_k(&max) {
             model.max_tokens = v;
             applied = true;
         }
@@ -9357,6 +9381,31 @@ impl ClientApp {
         }
     }
 }
+#[cfg(test)]
+mod cap_k_tests {
+    use super::ClientApp as App;
+
+    #[test]
+    fn display_in_k_without_losing_precision() {
+        assert_eq!(App::fmt_cap_k(200_000), "200k");
+        assert_eq!(App::fmt_cap_k(16_384), "16.384k");
+        assert_eq!(App::fmt_cap_k(102_400), "102.4k");
+        assert_eq!(App::fmt_cap_k(1_024_000), "1024k");
+    }
+
+    #[test]
+    fn round_trip_keeps_stored_value() {
+        for v in [0u64, 999, 16_384, 128_000, 1_024_000] {
+            let shown = App::fmt_cap_k(v);
+            assert_eq!(App::parse_cap_k(&shown), Some(v), "{shown}");
+        }
+        assert_eq!(App::parse_cap_k(" 200K "), Some(200_000));
+        assert_eq!(App::parse_cap_k("128000"), Some(128_000));
+        assert_eq!(App::parse_cap_k("abc"), None);
+        assert_eq!(App::parse_cap_k("-1k"), None);
+    }
+}
+
 #[cfg(test)]
 mod tab_icon_tests {
     use super::{
