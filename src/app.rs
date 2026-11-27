@@ -4689,42 +4689,121 @@ fn strip_geom_for_frame(
         }
     }
 
-    /// 用 VS Code 打开目录。依赖 code CLI 已安装并加入 PATH。
+    /// 在 PATH 里定位 VS Code CLI：只认实际存在的 code.cmd / code.exe / Code.exe。
+    /// 不写死安装目录；调用处用绝对路径，避免 cmd 自己的查找/PATHEXT 差异。
+    fn vscode_cli_in(path: &std::ffi::OsStr) -> Option<PathBuf> {
+        #[cfg(windows)]
+        let (names, exts) = (["code", "Code"], [".cmd", ".exe"]);
+        #[cfg(not(windows))]
+        let (names, exts) = (["code"], [""]);
+        std::env::split_paths(path).find_map(|dir| {
+            names.iter().find_map(|name| {
+                exts.iter()
+                    .map(|ext| dir.join(format!("{name}{ext}")))
+                    .find(|p| p.is_file())
+            })
+        })
+    }
+
+    /// 进程环境可能是安装 VS Code 之前继承来的旧 PATH：把注册表里持久化的
+    /// 用户/系统 PATH 补在后面再找，仍不写死任何安装路径。
+    #[cfg(windows)]
+    fn vscode_search_path() -> std::ffi::OsString {
+        use std::os::windows::process::CommandExt;
+        let fallback = std::env::var_os("PATH").unwrap_or_default();
+        let mut dirs: Vec<PathBuf> = std::env::split_paths(&fallback).collect();
+        for key in [
+            r"HKCU\Environment",
+            r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+        ] {
+            let Ok(out) = std::process::Command::new("reg")
+                .args(["query", key, "/v", "Path"])
+                .creation_flags(0x0800_0000)
+                .output()
+            else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&out.stdout);
+            let Some(line) = text
+                .lines()
+                .find(|l| l.contains("REG_SZ") || l.contains("REG_EXPAND_SZ"))
+            else {
+                continue;
+            };
+            let Some((_, value)) = line
+                .split_once("REG_EXPAND_SZ")
+                .or_else(|| line.split_once("REG_SZ"))
+            else {
+                continue;
+            };
+            for dir in std::env::split_paths(value.trim()) {
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
+            }
+        }
+        std::env::join_paths(dirs).unwrap_or(fallback)
+    }
+
+    /// 用 VS Code 打开目录：从 PATH 解析出 CLI 绝对路径后再调用。
     fn open_in_vscode(&mut self, dir: &str) {
         #[cfg(windows)]
+        let path = Self::vscode_search_path();
+        #[cfg(not(windows))]
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let Some(cli) = Self::vscode_cli_in(&path) else {
+            self.status = Some(
+                "打开 VS Code 失败：PATH 中未找到 code（安装时勾选「添加到 PATH」后重启本软件）".into(),
+            );
+            return;
+        };
+
+        #[cfg(windows)]
         let result = {
-            use std::os::windows::process::CommandExt;
             use std::io::Write;
-            // cmd /c 通过系统代码页（GBK）转码命令行，中文路径会乱码。
-            // 写临时 .cmd 文件：先 chcp 65001 切 UTF-8，再 code --new-window。
-            // .cmd 本身用 UTF-8 写入，chcp 65001 让 cmd 按 UTF-8 解析后续行。
-            let bat = std::env::temp_dir().join("codebuff_open.cmd");
-            let content = format!("@chcp 65001 >nul\r\n@code --new-window \"{}\"\r\n", dir);
-            if let Ok(mut f) = std::fs::File::create(&bat) {
-                let _ = f.write_all(content.as_bytes());
-                drop(f);
-                let r = std::process::Command::new("cmd")
+            use std::os::windows::process::CommandExt;
+            // cmd /c 按系统代码页（GBK）解释命令行，中文路径会乱码：写 UTF-8
+            // 临时 .cmd + chcp 65001。CLI 用上面解析出的绝对路径，不再依赖
+            // cmd 自己的 PATH/PATHEXT 查找；% 在 .cmd 里会被环境变量展开，需转义。
+            let bat = std::env::temp_dir().join("tpm_open_vscode.cmd");
+            let content = format!(
+                "@chcp 65001 >nul\r\n@\"{}\" --new-window \"{}\"\r\n",
+                cli.display(),
+                dir.replace('%', "%%")
+            );
+            let written = match std::fs::File::create(&bat) {
+                Ok(mut f) => f.write_all(content.as_bytes()).is_ok(),
+                Err(_) => false,
+            };
+            if written {
+                let out = std::process::Command::new("cmd")
                     .args(["/c", bat.to_str().unwrap_or("")])
                     .creation_flags(0x0800_0000)
                     .output();
                 let _ = std::fs::remove_file(&bat);
-                r
+                out
             } else {
-                // 降级：直接调用 code（路径可能乱码但不至于崩溃）
-                std::process::Command::new("code")
-                    .args(["--new-window"])
-                    .arg(dir)
-                    .creation_flags(0x0800_0000)
-                    .output()
+                Err(std::io::Error::other("无法写临时 .cmd"))
             }
         };
+
         #[cfg(not(windows))]
-        let result = std::process::Command::new("code").arg(dir).output();
+        let result = std::process::Command::new(cli).arg(dir).output();
+
         match result {
             Ok(o) if o.status.success() => {
                 self.status = Some(format!("已在 VS Code 中打开: {dir}"));
             }
-            Ok(_) => self.status = Some("打开 VS Code 失败：未找到 code 命令（请确认已安装 VS Code 并选择「添加到 PATH」）".to_string()),
+            // 旧实现把任何非零退出都报成「未找到 code 命令」，真正原因被吞掉。
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let detail = stderr.trim();
+                self.status = Some(if detail.is_empty() {
+                    format!("打开 VS Code 失败（code 退出码 {}）", o.status)
+                } else {
+                    format!("打开 VS Code 失败: {detail}")
+                });
+            }
             Err(e) => self.status = Some(format!("打开 VS Code 失败: {e}")),
         }
     }
@@ -11597,5 +11676,25 @@ mod live_install_tests {
                 println!("未装上，正式名仍是旧版（已回滚）：{}", msgs.joined());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod vscode_cli_tests {
+    use super::ClientApp;
+
+    #[test]
+    fn finds_cli_from_path_without_hardcoded_location() {
+        let dir = std::env::temp_dir().join(format!("tpm_vscode_cli_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let cli = dir.join(if cfg!(windows) { "code.cmd" } else { "code" });
+        let _ = std::fs::write(&cli, "");
+
+        let path = std::env::join_paths([dir.clone()]).unwrap();
+        assert_eq!(ClientApp::vscode_cli_in(&path), Some(cli));
+        let empty = std::env::join_paths(std::iter::empty::<&std::ffi::OsStr>()).unwrap();
+        assert_eq!(ClientApp::vscode_cli_in(&empty), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
