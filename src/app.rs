@@ -8588,8 +8588,9 @@ impl eframe::App for ClientApp {
         }
 
         // 「已查看」同时管 ✅ 图标与**系统通知**：切到别的页签、或鼠标把窗口点回
-        // 前台就把 ✅ 清成空（tab_icon_from_snap 每帧直读，立刻生效）。记账点只有
-        // 这两处：终端内的打字/滚轮/点击**不算**——回显与真输出同路，状态只该看输出。
+        // 前台就把 ✅ 清成空（tab_icon_from_snap 每帧直读，立刻生效）。记账点三处：
+        // 这两处 + 终端内单击/滚轮（terminal.rs show_terminal，人在那页上动过就是
+        // 看过了）。打字**不算**——回显与真输出同路，状态只该看输出。
         // 没交互过就一直算「未查看」→ 激活页签跑完照样亮 ✅；新一轮输出会复位
         // viewed（session.rs 读循环），下一轮跑完再亮。
         for (i, t) in self.tabs.iter().enumerate() {
@@ -9159,8 +9160,8 @@ if self.spawning.is_empty() && !self.restore_slots.is_empty() {
 
         // 浮层两件套放在中央面板**之后**：它们要盖在内容（含终端）之上，且要
         // 用到本帧的窗口坐标，所以放在这里、不放进任何面板。
-        self.settings_button(ui);
-        self.settings_window(ui);
+        let settings_opened_now = self.settings_button(ui);
+        self.settings_window(ui, settings_opened_now);
 
         self.input_dialog(ui);
         self.confirm_dialog(ui);
@@ -9189,7 +9190,10 @@ impl ClientApp {
     /// 于是窗口一打开就正好盖住这颗按钮——这是故意的：窗口开着时按钮的用途变成
     /// 「收起来」，被盖住就不该抢点击。收起后按钮露出来，位置本身没变（不会
     /// 在界面上跳来跳去）。
-    fn settings_button(&mut self, ui: &mut egui::Ui) {
+    /// 返回「本帧是否刚打开窗口」：设置窗口要靠它跳过本帧的「点窗外收起」，
+    /// 否则刚被这颗按钮打开就被同一次点击关掉（按钮通常落在窗口矩形之外）。
+    fn settings_button(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut opened_now = false;
         let bounds = ui.max_rect();
         let pos = bounds.right_bottom() - egui::vec2(SETTINGS_BTN_MARGIN, SETTINGS_BTN_MARGIN);
         egui::Area::new(egui::Id::new("settings_btn"))
@@ -9215,13 +9219,19 @@ impl ClientApp {
                         self.close_settings();
                     } else {
                         self.open_settings();
+                        opened_now = true;
                     }
                 }
             });
+        opened_now
     }
 
     /// 设置浮层窗口本体（关闭状态下**什么都不画**：不占位、不吃点击）。
-    fn settings_window(&mut self, ui: &mut egui::Ui) {
+    ///
+    /// 点窗口外任意处 = 收起（浮层遮挡时「先点一下外面」是用户的自然动作，
+    /// 不必去找 × 或那颗被盖住的 ⚙）。`opened_now` 是 settings_button 本帧
+    /// 刚打开窗口的标记，那一帧的点击就是「打开」本身，不能再当「点外面」。
+    fn settings_window(&mut self, ui: &mut egui::Ui, opened_now: bool) {
         if !self.settings_open {
             return;
         }
@@ -9334,7 +9344,15 @@ impl ClientApp {
         {
             self.config.settings.settings_win_pos = Some([pos.x, pos.y]);
         }
-        if closed || out.response.should_close() {
+        // 点窗外收起：egui 的 click 已排除拖动（拖标题栏/拖选文本不会误关）。
+        let clicked_outside = !opened_now
+            && ui.input(|i| {
+                i.pointer.any_click()
+                    && i.pointer
+                        .interact_pos()
+                        .is_some_and(|p| !out.response.rect.contains(p))
+            });
+        if closed || clicked_outside || out.response.should_close() {
             self.close_settings();
         }
     }
