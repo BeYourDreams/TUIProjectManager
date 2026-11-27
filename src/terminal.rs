@@ -944,9 +944,9 @@ pub fn show_terminal(
     let perf = perf_on();
     let perf_t0 = std::time::Instant::now();
     let mut perf_f = PerfFrame::default();
-    // ── 交互**不改写页签状态**：打字/滚轮/点击只是回显，与真输出同路，✅/🔄
-    // 一律由终端输出本身判（app.rs tab_icon）。“已查看”（消 ✅）只在切页签与
-    // 窗口找回前台时记账（app.rs）。
+    // ── 交互**不改写状态图标**：打字/滚轮/点击只是回显，与真输出同路，✅/🔄
+    // 一律由终端输出本身判（app.rs tab_icon）。交互只记一笔「已查看」（抹 ✅，
+    // 见下方 over_term 处的记账）：人在这页上点了一下/拨了滚轮，就是看过了。
 
     let font_id = FontId::monospace(TERM_FONT_SIZE);
     let ppp = ui.ctx().pixels_per_point();
@@ -1081,6 +1081,13 @@ if resized {
     // 滚轮自然留给浮层自己的 ScrollArea。
     // 未被终端消费的帧（指针在别处）直接丢弃：滚轮不排队，否则会攒成延迟滚动。
     let over_term = wheel.has_scroll() && ui.rect_contains_pointer(rect);
+    // 单击（任意键，含拖选/右键菜单那一按）或滚轮落在终端上 = 人正盯着这页 →
+    // 记「已查看」，✅ 立刻熄灭（app.rs tab_icon_from_snap 每帧直读 viewed）。
+    // reader 每轮新输出会复位 viewed（session.rs），所以「看了旧的又跑了新的」
+    // 照样会再亮 ✅。悬停不算：鼠标只是路过不该消掉提醒。
+    if over_term || (resp.hovered() && ui.input(|i| i.pointer.any_pressed())) {
+        sess.has_been_viewed.store(true, Ordering::Relaxed);
+    }
     if over_term {
         // 清掉 egui 的平滑增量：终端自己按档位滚动，同一份位移不能再流向
         // 其他 ScrollArea（页签栏/设置页），否则滚终端会连带滚别的滚动区。
